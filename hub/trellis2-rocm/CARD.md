@@ -91,7 +91,32 @@ vmap, uv_faces, uvs = k.pack_charts(v, f, torch.tensor([0, 4, 8]), torch.tensor(
 
 ## Compatibility
 
-{{ compatibility }}
+- Linux x86_64 with ROCm, on gfx942 (MI300X / MI300A / MI325X) and gfx950 (MI350X / MI355X). `get_kernel` picks the build matching your PyTorch and ROCm versions.
+- 12 builds from `kernel-builder` cover torch 2.10 through 2.15 with ROCm 7.0, 7.1, 7.2, 7.14 and 10.0.
+- 1 extra build, `torch213-rocm101`, covers torch 2.13 with ROCm 10.1, which is outside `kernel-builder`'s matrix. It was built with `build_variant.py` against the ROCm 10.1 SDK on Ubuntu, so it needs glibc 2.43 or newer and is not manylinux_2_28-compatible.
+- Known issue: `kernels` 0.18.3 reads the `rocm714` in a build name as ROCm 71.4, so it does not select the two ROCm 7.14 builds. On torch 2.14 + ROCm 7.14 it loads the ROCm 7.2 build instead, which works; on torch 2.15 + ROCm 7.14 it finds no build.
+
+### Test results
+
+The full test suite (34 tests: 4 `mesh_udf`, 7 `telea_inpaint` including the comparison with `cv2.inpaint`, 14 `grid_sample_trilinear`, 9 `pack_charts`) on an AMD Instinct MI350X (gfx950), each build loaded in an environment with the matching PyTorch wheel:
+
+| Build | torch | ROCm | Result |
+|---|---|---|---|
+| `torch210-rocm70` | 2.10.0 | 7.0 | 34/34 passed |
+| `torch210-rocm71` | 2.10.0 | 7.1 | 34/34 passed |
+| `torch211-rocm71` | 2.11.0 | 7.1 | 34/34 passed |
+| `torch211-rocm72` | 2.11.0 | 7.2 | 34/34 passed |
+| `torch212-rocm71` | 2.12.1 | 7.1 | 34/34 passed |
+| `torch212-rocm72` | 2.12.1 | 7.2 | 34/34 passed |
+| `torch213-rocm71` | 2.13.0 | 7.1 | 34/34 passed |
+| `torch213-rocm72` | 2.13.0 | 7.2 | 34/34 passed |
+| `torch213-rocm101` | 2.13.0 | 10.1 | 34/34 passed |
+| `torch214-rocm72` | 2.14.1 | 7.2 | 34/34 passed |
+| `torch214-rocm714` | 2.14.1 | 7.14 | 34/34 passed (loaded directly, see the known issue) |
+| `torch215-rocm714` | 2.15.0 | 7.14 | 34/34 passed (loaded directly, see the known issue) |
+| `torch215-rocm100` | 2.15.0 | 10.0 | 34/34 passed |
+
+The gfx942 code is compiled into every build but has not been run: no MI300 was available.
 
 ## Source and license
 
