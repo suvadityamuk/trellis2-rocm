@@ -1,0 +1,31 @@
+[general]
+name = "trellis2-rocm"
+version = 1
+edition = 6
+license = "Apache-2.0"
+backends = ["rocm"]
+source = "https://github.com/suvadityamuk/trellis2-rocm"
+
+[general.hub]
+repo-id = "suvadityamuk/trellis2-rocm"
+
+[torch]
+src = [
+    "torch-ext/torch_binding.cpp",
+    "torch-ext/torch_binding.h",
+]
+
+[kernel.mesh]
+language = "cpp-rocm"
+depends = ["torch"]
+include = ["trellis2_rocm"]
+rocm-archs = ["gfx942", "gfx950"]
+src = [
+    "trellis2_rocm/common.h",
+    "trellis2_rocm/lbvh.hip",
+    "trellis2_rocm/telea.hip",
+    "trellis2_rocm/grid_sample.hip",
+    "trellis2_rocm/uv_atlas.cpp",
+    "trellis2_rocm/xatlas/xatlas.cpp",
+    "trellis2_rocm/xatlas/xatlas.h",
+]
