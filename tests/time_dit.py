@@ -1,9 +1,10 @@
 import sys, time, torch
 from t2r.dit import FlowDiT
+from t2r.pipeline import CKPT
 k = sys.argv[1] if len(sys.argv) > 1 else "0a34fae7"
 P = torch.load(f"out/ref/{k}/pipe.pt", weights_only=False)
 c = P["dit.shape_slat_flow_model_1024.call0"]
-m = FlowDiT("/home/suvadityamuk/ckpts/TRELLIS.2-4B/ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors", False)
+m = FlowDiT(f"{CKPT}/ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors", False)
 x = c["x"]["feats"].cuda(); m.set_coords(c["x"]["coords"].cuda()); t = c["t"].cuda(); cond = c["cond"].cuda(); neg = torch.zeros_like(cond)
 print("tokens", x.shape[0])
 def bench(fn, n=5):

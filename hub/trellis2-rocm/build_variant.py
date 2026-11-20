@@ -2,7 +2,8 @@
 
 kernel-builder (`nix run .#build-and-copy`) is the reproducible route and covers the torch x ROCm matrix it supports.
 This script is for combinations outside that matrix (for example torch 2.13 + ROCm 10.1): it writes
-build/torch<XY>-rocm<XY>-x86_64-linux/ in the same layout, including metadata.json with file digests.
+build/torch<XY>-rocm<XY>-x86_64-linux/ in the same layout, including metadata.json with file digests (but no
+provenance record or symbols.json, and linked against the host's glibc rather than manylinux_2_28).
 
 Usage: python build_variant.py [--archs gfx942 gfx950] [--out build]
 Needs hipcc (ROCm SDK) on PATH and the torch headers of the active environment.
@@ -46,7 +47,7 @@ ops_name = f"_{pyname}_rocm_{h.hexdigest()[:7]}"
 out = os.path.join(a.out, variant)
 obj = os.path.join(a.out, ".obj", variant)
 shutil.rmtree(out, ignore_errors=True); shutil.rmtree(obj, ignore_errors=True)
-os.makedirs(os.path.join(out, pyname)); os.makedirs(obj)
+os.makedirs(out); os.makedirs(obj)
 
 inc = [f"-I{p}" for p in cpp_extension.include_paths(device_type="cuda")]
 inc += [f"-I{sysconfig.get_paths()['include']}", f"-I{ROOT}/torch-ext"] + [f"-I{ROOT}/{d}" for d in kernel.get("include", [])]
@@ -100,42 +101,13 @@ def add_op_namespace_prefix(op_name: str):
     """
     return f"{ops_name}::{{op_name}}"
 ''')
-# compatibility package for older `kernels` releases, as kernel-builder writes it
-open(os.path.join(out, pyname, "__init__.py"), "w").write('''import ctypes
-import importlib.util
-import sys
-from pathlib import Path
-from types import ModuleType
-
-
-def _import_from_path(file_path: Path) -> ModuleType:
-    # We cannot use the module name as-is, after adding it to `sys.modules`,
-    # it would also be used for other imports. So, we make a module name that
-    # depends on the path for it to be unique using the hex-encoded hash of
-    # the path.
-    path_hash = "{:x}".format(ctypes.c_size_t(hash(file_path.absolute())).value)
-    module_name = path_hash
-    spec = importlib.util.spec_from_file_location(module_name, file_path)
-    if spec is None:
-        raise ImportError(f"Cannot load spec for {module_name} from {file_path}")
-    module = importlib.util.module_from_spec(spec)
-    if module is None:
-        raise ImportError(f"Cannot load module {module_name} from spec")
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)  # type: ignore
-    return module
-
-
-globals().update(vars(_import_from_path(Path(__file__).parent.parent / "__init__.py")))
-''')
-
 files = {}
 for d, _, fs in os.walk(out):
     for f in fs:
         p = os.path.join(d, f)
         files[os.path.relpath(p, out)] = base64.b64encode(hashlib.sha256(open(p, "rb").read()).digest()).decode()
-meta = {"name": name, "id": ops_name, "version": cfg["general"]["version"], "license": cfg["general"]["license"],
-        "source": cfg["general"]["source"], "python-depends": [], "backend": {"type": "rocm", "archs": archs},
+meta = {"name": name, "id": ops_name, "version": cfg["general"]["version"], "build-layout": "files", "kernels-minver": "0.14.0",
+        "license": cfg["general"]["license"], "source": cfg["general"]["source"], "python-depends": [], "kernel-depends": [], "backend": {"type": "rocm", "archs": archs},
         "digest": {"algorithm": "sha256", "files": dict(sorted(files.items()))}}
 json.dump(meta, open(os.path.join(out, "metadata.json"), "w"), indent=2)
 open(os.path.join(out, "metadata.json"), "a").write("\n")

@@ -2,7 +2,9 @@
 Usage: python tools/cmp_dumps.py out/ref out/ref2 [pipe|glb]"""
 import os, sys
 import numpy as np, torch
-sys.path.insert(0, os.path.expanduser("~/src/TRELLIS.2"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import refenv
+sys.path.insert(0, refenv.TRELLIS)
 
 
 def flat(x, p=""):

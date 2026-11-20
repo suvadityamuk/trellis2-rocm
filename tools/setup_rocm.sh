@@ -5,6 +5,7 @@ set -euo pipefail
 ARCHS=${ARCHS:-"gfx942;gfx950"}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SRC=${SRC:-$HOME/src}; mkdir -p $SRC/ext
+CKPT=${TRELLIS2_CKPT:-$HOME/ckpts/TRELLIS.2-4B}
 export GPU_ARCHS=$ARCHS PYTORCH_ROCM_ARCH=$ARCHS MAX_JOBS=${MAX_JOBS:-64}
 pip install -q imageio imageio-ffmpeg tqdm easydict opencv-python-headless ninja trimesh "transformers==4.56.2" pandas \
   zstandard kornia timm scipy rtree pybind11 psutil safetensors "huggingface_hub<1.0" hf_transfer matplotlib
@@ -38,5 +39,7 @@ cd $SRC/ext
 (cd $ROOT && T2R_ARCHS=$ARCHS python3 setup.py build_ext --inplace)
 # weights (TRELLIS.2-4B local; DINOv3 is gated: put HF_TOKEN in $ROOT/.env)
 [ -f $ROOT/.env ] && set -a && . $ROOT/.env && set +a
-hf download microsoft/TRELLIS.2-4B --local-dir $HOME/ckpts/TRELLIS.2-4B
+hf download microsoft/TRELLIS.2-4B --local-dir $CKPT
 python3 -c "import torch, flash_attn, flex_gemm, cumesh, t2r_cumesh, o_voxel, nvdiffrast.torch, t2r._C; print('env ok', torch.__version__, flash_attn.__version__)"
+[ "$SRC" = "$HOME/src" ] || echo "note: export TRELLIS2_SRC=$SRC/TRELLIS.2 before running t2r (default is ~/src/TRELLIS.2)"
+[ "$CKPT" = "$HOME/ckpts/TRELLIS.2-4B" ] || echo "note: export TRELLIS2_CKPT=$CKPT before running t2r (default is ~/ckpts/TRELLIS.2-4B)"

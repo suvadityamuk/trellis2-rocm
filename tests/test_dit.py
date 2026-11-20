@@ -1,9 +1,10 @@
 """t2r FlowDiT vs official DiT calls recorded by ref_dump (teacher forcing): parity bitwise, fast within tolerance."""
 import sys, time, torch
 from t2r.dit import FlowDiT
+from t2r.pipeline import CKPT
 k = sys.argv[1] if len(sys.argv) > 1 else "0a34fae7"
 P = torch.load(f"out/ref/{k}/pipe.pt", weights_only=False)
-ck = "/home/suvadityamuk/ckpts/TRELLIS.2-4B/ckpts/"
+ck = f"{CKPT}/ckpts/"
 models = {"sparse_structure_flow_model": ("ss_flow_img_dit_1_3B_64_bf16", True),
           "shape_slat_flow_model_512": ("slat_flow_img2shape_dit_1_3B_512_bf16", False),
           "shape_slat_flow_model_1024": ("slat_flow_img2shape_dit_1_3B_1024_bf16", False),
