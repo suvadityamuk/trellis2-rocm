@@ -40,6 +40,7 @@ cd $SRC/ext
 # weights (TRELLIS.2-4B local; DINOv3 is gated: put HF_TOKEN in $ROOT/.env)
 [ -f $ROOT/.env ] && set -a && . $ROOT/.env && set +a
 hf download microsoft/TRELLIS.2-4B --local-dir $CKPT
+cd $ROOT  # t2r is used from the repository root, not installed
 python3 -c "import torch, flash_attn, flex_gemm, cumesh, t2r_cumesh, o_voxel, nvdiffrast.torch, t2r._C; print('env ok', torch.__version__, flash_attn.__version__)"
 [ "$SRC" = "$HOME/src" ] || echo "note: export TRELLIS2_SRC=$SRC/TRELLIS.2 before running t2r (default is ~/src/TRELLIS.2)"
 [ "$CKPT" = "$HOME/ckpts/TRELLIS.2-4B" ] || echo "note: export TRELLIS2_CKPT=$CKPT before running t2r (default is ~/ckpts/TRELLIS.2-4B)"
