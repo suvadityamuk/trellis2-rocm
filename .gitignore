@@ -1,0 +1,9 @@
+build/
+*.so
+csrc/*_hip.*
+out/
+__pycache__/
+*.egg-info/
+.env
+logs/
+bench_old/

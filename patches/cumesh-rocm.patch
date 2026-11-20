@@ -1,0 +1,134 @@
+diff --git a/setup.py b/setup.py
+index 8849b10..3b4148f 100644
+--- a/setup.py
++++ b/setup.py
+@@ -115,10 +115,9 @@ ext_modules = [
+         ],
+         extra_compile_args={
+             "cxx": cxx_flags,
+-            "nvcc": nvcc_flags + [
++            "nvcc": nvcc_flags + ([] if IS_HIP else ["--extended-lambda"]) + [
+                 # The following definitions must be undefined
+                 # since we need half-precision operation.
+-                "--extended-lambda",
+                 "-U__CUDA_NO_HALF_OPERATORS__",
+                 "-U__CUDA_NO_HALF_CONVERSIONS__",
+                 "-U__CUDA_NO_HALF2_OPERATORS__",
+diff --git a/src/atlas.cu b/src/atlas.cu
+index d48031f..af3617b 100644
+--- a/src/atlas.cu
++++ b/src/atlas.cu
+@@ -323,7 +323,9 @@ static void get_chart_connectivity(
+         M, 0, sizeof(uint64_t) * 8, stream
+     ));
+ 
+-    #if CUDART_VERSION >= 12090
++    #if defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM)
++        auto reduce_op = ::hipcub::Sum();
++    #elif CUDART_VERSION >= 12090
+         auto reduce_op = ::cuda::std::plus();
+     #else
+         auto reduce_op = cub::Sum();
+diff --git a/src/clean_up.cu b/src/clean_up.cu
+index a72b1d0..04115a4 100644
+--- a/src/clean_up.cu
++++ b/src/clean_up.cu
+@@ -237,13 +237,19 @@ static __global__ void select_first_in_each_group_kernel(
+ }
+ 
+ 
+-struct int3_decomposer
+-{
+-    __host__ __device__ ::cuda::std::tuple<int&, int&, int&> operator()(int3& key) const
+-    {
+-        return {key.x, key.y, key.z};
+-    }
+-};
++// Lexicographic (x, y, z) key sort without cub's tuple decomposer (unavailable in hipCUB):
++// three stable LSD radix passes (z, then y, then x) give the same permutation as the decomposer sort.
++static __global__ void gather_face_component_kernel(const int3* faces, const int* perm, int comp, int F, int* out) {
++    int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= F) return;
++    int3 f = faces[perm[tid]];
++    out[tid] = comp == 0 ? f.x : (comp == 1 ? f.y : f.z);
++}
++static __global__ void gather_faces_kernel(const int3* faces, const int* perm, int F, int3* out) {
++    int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= F) return;
++    out[tid] = faces[perm[tid]];
++}
+ 
+ 
+ void CuMesh::remove_duplicate_faces() {
+@@ -275,23 +281,32 @@ void CuMesh::remove_duplicate_faces() {
+     CUDA_CHECK(cudaMalloc(&cu_sorted_indices_output, F * sizeof(int)));
+     CUDA_CHECK(cudaMalloc(&cu_sorted_faces_output, F * sizeof(int3)));
+ 
+-    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+-        nullptr, temp_storage_bytes,
+-        cu_sorted_faces, cu_sorted_faces_output,
+-        cu_sorted_face_indices, cu_sorted_indices_output,
+-        F,
+-        int3_decomposer{},
+-        stream
+-    ));
+-    this->cub_temp_storage.resize(temp_storage_bytes);
+-    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+-        this->cub_temp_storage.ptr, temp_storage_bytes,
+-        cu_sorted_faces, cu_sorted_faces_output,
+-        cu_sorted_face_indices, cu_sorted_indices_output,
+-        F,
+-        int3_decomposer{},
+-        stream
+-    ));
++    {
++        int *cu_keys_in, *cu_keys_out, *cu_perm_tmp;
++        CUDA_CHECK(cudaMalloc(&cu_keys_in, F * sizeof(int)));
++        CUDA_CHECK(cudaMalloc(&cu_keys_out, F * sizeof(int)));
++        CUDA_CHECK(cudaMalloc(&cu_perm_tmp, F * sizeof(int)));
++        CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
++            nullptr, temp_storage_bytes, cu_keys_in, cu_keys_out, cu_sorted_face_indices, cu_perm_tmp, F, 0, 32, stream));
++        this->cub_temp_storage.resize(temp_storage_bytes);
++        int* perm_in = cu_sorted_face_indices;
++        int* perm_out = cu_perm_tmp;
++        for (int comp = 2; comp >= 0; comp--) {
++            gather_face_component_kernel<<<(F+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(cu_sorted_faces, perm_in, comp, F, cu_keys_in);
++            CUDA_CHECK(cudaGetLastError());
++            CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
++                this->cub_temp_storage.ptr, temp_storage_bytes, cu_keys_in, cu_keys_out, perm_in, perm_out, F, 0, 32, stream));
++            std::swap(perm_in, perm_out);
++        }
++        // after 3 passes the final permutation lives in perm_out's partner (perm_in)
++        CUDA_CHECK(cudaMemcpyAsync(cu_sorted_indices_output, perm_in, F * sizeof(int), cudaMemcpyDeviceToDevice, stream));
++        gather_faces_kernel<<<(F+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(cu_sorted_faces, cu_sorted_indices_output, F, cu_sorted_faces_output);
++        CUDA_CHECK(cudaGetLastError());
++        CUDA_CHECK(cudaStreamSynchronize(stream));
++        CUDA_CHECK(cudaFree(cu_keys_in));
++        CUDA_CHECK(cudaFree(cu_keys_out));
++        CUDA_CHECK(cudaFree(cu_perm_tmp));
++    }
+ 
+     // Select first in each group of duplicate faces (based on sorted faces)
+     uint8_t* cu_face_mask_sorted;
+diff --git a/src/dtypes.cuh b/src/dtypes.cuh
+index bff560c..f951c39 100644
+--- a/src/dtypes.cuh
++++ b/src/dtypes.cuh
+@@ -13,7 +13,7 @@ namespace cumesh {
+ struct __align__(16) Vec3f {
+     float x, y, z;
+ 
+-    __device__ __forceinline__ Vec3f();
++    __host__ __device__ __forceinline__ Vec3f();
+     __device__ __forceinline__ Vec3f(float x, float y, float z);
+     __device__ __forceinline__ Vec3f(float3 v);
+     __device__ __forceinline__ Vec3f operator+(const Vec3f& o) const;
+@@ -55,7 +55,7 @@ struct __align__(16) QEM
+ };
+ 
+ 
+-__device__ __forceinline__ Vec3f::Vec3f() {
++__host__ __device__ __forceinline__ Vec3f::Vec3f() {
+     x = 0.0f;
+     y = 0.0f;
+     z = 0.0f;

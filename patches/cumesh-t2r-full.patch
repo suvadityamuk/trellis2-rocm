@@ -1,0 +1,323 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index e7ff574..d3a377a 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
+ 
+ 
+ [project]
+-name = "cumesh"
++name = "t2r_cumesh"
+ version = "0.0.1"
+ description = "Cuda mesh utils"
+ requires-python = ">=3.8"
+diff --git a/setup.py b/setup.py
+index 8849b10..6a73136 100644
+--- a/setup.py
++++ b/setup.py
+@@ -60,6 +60,7 @@ else:
+ if IS_HIP:
+     archs = os.getenv("GPU_ARCHS", "native").split(";")
+     nvcc_flags += [f"--offload-arch={arch}" for arch in archs]
++    nvcc_flags += ["-include", os.path.join(ROOT, "src", "t2r_alloc.h")]
+ else:
+     # CUDA only
+     if IS_WINDOWS:
+@@ -74,7 +75,7 @@ ext_modules = [
+     # Main CuMesh extension
+     # ===============================
+     CUDAExtension(
+-        name="cumesh._C",
++        name="t2r_cumesh._C",
+         sources=[
+             "src/hash/hash.cu",
+ 
+@@ -103,7 +104,7 @@ ext_modules = [
+     # cubvh
+     # ===============================
+     CUDAExtension(
+-        name="cumesh._cubvh",
++        name="t2r_cumesh._cubvh",
+         sources=[
+             "third_party/cubvh/src/bvh.cu",
+             "third_party/cubvh/src/api_gpu.cu",
+@@ -115,10 +116,9 @@ ext_modules = [
+         ],
+         extra_compile_args={
+             "cxx": cxx_flags,
+-            "nvcc": nvcc_flags + [
++            "nvcc": nvcc_flags + ([] if IS_HIP else ["--extended-lambda"]) + [
+                 # The following definitions must be undefined
+                 # since we need half-precision operation.
+-                "--extended-lambda",
+                 "-U__CUDA_NO_HALF_OPERATORS__",
+                 "-U__CUDA_NO_HALF_CONVERSIONS__",
+                 "-U__CUDA_NO_HALF2_OPERATORS__",
+@@ -130,7 +130,7 @@ ext_modules = [
+     # xatlas (CPU only)
+     # ===============================
+     CUDAExtension(
+-        name="cumesh._cumesh_xatlas",
++        name="t2r_cumesh._cumesh_xatlas",
+         sources=[
+             "third_party/xatlas/xatlas.cpp",
+             "third_party/xatlas/binding.cpp",
+@@ -145,8 +145,8 @@ ext_modules = [
+ # Setup
+ # -------------------------------------------------
+ setup(
+-    name="cumesh",
+-    packages=["cumesh"],
++    name="t2r_cumesh",
++    packages=["t2r_cumesh"],
+     ext_modules=ext_modules,
+     cmdclass={"build_ext": BuildExtension},
+ )
+diff --git a/src/atlas.cu b/src/atlas.cu
+index d48031f..af3617b 100644
+--- a/src/atlas.cu
++++ b/src/atlas.cu
+@@ -323,7 +323,9 @@ static void get_chart_connectivity(
+         M, 0, sizeof(uint64_t) * 8, stream
+     ));
+ 
+-    #if CUDART_VERSION >= 12090
++    #if defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM)
++        auto reduce_op = ::hipcub::Sum();
++    #elif CUDART_VERSION >= 12090
+         auto reduce_op = ::cuda::std::plus();
+     #else
+         auto reduce_op = cub::Sum();
+diff --git a/src/clean_up.cu b/src/clean_up.cu
+index a72b1d0..04115a4 100644
+--- a/src/clean_up.cu
++++ b/src/clean_up.cu
+@@ -237,13 +237,19 @@ static __global__ void select_first_in_each_group_kernel(
+ }
+ 
+ 
+-struct int3_decomposer
+-{
+-    __host__ __device__ ::cuda::std::tuple<int&, int&, int&> operator()(int3& key) const
+-    {
+-        return {key.x, key.y, key.z};
+-    }
+-};
++// Lexicographic (x, y, z) key sort without cub's tuple decomposer (unavailable in hipCUB):
++// three stable LSD radix passes (z, then y, then x) give the same permutation as the decomposer sort.
++static __global__ void gather_face_component_kernel(const int3* faces, const int* perm, int comp, int F, int* out) {
++    int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= F) return;
++    int3 f = faces[perm[tid]];
++    out[tid] = comp == 0 ? f.x : (comp == 1 ? f.y : f.z);
++}
++static __global__ void gather_faces_kernel(const int3* faces, const int* perm, int F, int3* out) {
++    int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= F) return;
++    out[tid] = faces[perm[tid]];
++}
+ 
+ 
+ void CuMesh::remove_duplicate_faces() {
+@@ -275,23 +281,32 @@ void CuMesh::remove_duplicate_faces() {
+     CUDA_CHECK(cudaMalloc(&cu_sorted_indices_output, F * sizeof(int)));
+     CUDA_CHECK(cudaMalloc(&cu_sorted_faces_output, F * sizeof(int3)));
+ 
+-    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+-        nullptr, temp_storage_bytes,
+-        cu_sorted_faces, cu_sorted_faces_output,
+-        cu_sorted_face_indices, cu_sorted_indices_output,
+-        F,
+-        int3_decomposer{},
+-        stream
+-    ));
+-    this->cub_temp_storage.resize(temp_storage_bytes);
+-    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+-        this->cub_temp_storage.ptr, temp_storage_bytes,
+-        cu_sorted_faces, cu_sorted_faces_output,
+-        cu_sorted_face_indices, cu_sorted_indices_output,
+-        F,
+-        int3_decomposer{},
+-        stream
+-    ));
++    {
++        int *cu_keys_in, *cu_keys_out, *cu_perm_tmp;
++        CUDA_CHECK(cudaMalloc(&cu_keys_in, F * sizeof(int)));
++        CUDA_CHECK(cudaMalloc(&cu_keys_out, F * sizeof(int)));
++        CUDA_CHECK(cudaMalloc(&cu_perm_tmp, F * sizeof(int)));
++        CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
++            nullptr, temp_storage_bytes, cu_keys_in, cu_keys_out, cu_sorted_face_indices, cu_perm_tmp, F, 0, 32, stream));
++        this->cub_temp_storage.resize(temp_storage_bytes);
++        int* perm_in = cu_sorted_face_indices;
++        int* perm_out = cu_perm_tmp;
++        for (int comp = 2; comp >= 0; comp--) {
++            gather_face_component_kernel<<<(F+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(cu_sorted_faces, perm_in, comp, F, cu_keys_in);
++            CUDA_CHECK(cudaGetLastError());
++            CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
++                this->cub_temp_storage.ptr, temp_storage_bytes, cu_keys_in, cu_keys_out, perm_in, perm_out, F, 0, 32, stream));
++            std::swap(perm_in, perm_out);
++        }
++        // after 3 passes the final permutation lives in perm_out's partner (perm_in)
++        CUDA_CHECK(cudaMemcpyAsync(cu_sorted_indices_output, perm_in, F * sizeof(int), cudaMemcpyDeviceToDevice, stream));
++        gather_faces_kernel<<<(F+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(cu_sorted_faces, cu_sorted_indices_output, F, cu_sorted_faces_output);
++        CUDA_CHECK(cudaGetLastError());
++        CUDA_CHECK(cudaStreamSynchronize(stream));
++        CUDA_CHECK(cudaFree(cu_keys_in));
++        CUDA_CHECK(cudaFree(cu_keys_out));
++        CUDA_CHECK(cudaFree(cu_perm_tmp));
++    }
+ 
+     // Select first in each group of duplicate faces (based on sorted faces)
+     uint8_t* cu_face_mask_sorted;
+diff --git a/src/dtypes.cuh b/src/dtypes.cuh
+index bff560c..f951c39 100644
+--- a/src/dtypes.cuh
++++ b/src/dtypes.cuh
+@@ -13,7 +13,7 @@ namespace cumesh {
+ struct __align__(16) Vec3f {
+     float x, y, z;
+ 
+-    __device__ __forceinline__ Vec3f();
++    __host__ __device__ __forceinline__ Vec3f();
+     __device__ __forceinline__ Vec3f(float x, float y, float z);
+     __device__ __forceinline__ Vec3f(float3 v);
+     __device__ __forceinline__ Vec3f operator+(const Vec3f& o) const;
+@@ -55,7 +55,7 @@ struct __align__(16) QEM
+ };
+ 
+ 
+-__device__ __forceinline__ Vec3f::Vec3f() {
++__host__ __device__ __forceinline__ Vec3f::Vec3f() {
+     x = 0.0f;
+     y = 0.0f;
+     z = 0.0f;
+diff --git a/src/ext.cpp b/src/ext.cpp
+index 6ff1eaa..49c8dab 100644
+--- a/src/ext.cpp
++++ b/src/ext.cpp
+@@ -13,7 +13,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.def("hashmap_insert_3d_idx_as_val_cuda", &cumesh::hashmap_insert_3d_idx_as_val_cuda);
+ 
+     /* CUMESH */
+-    py::class_<cumesh::CuMesh>(m, "CuMesh")
++    py::class_<cumesh::CuMesh>(m, "CuMesh", py::module_local())
+         .def(py::init<>())
+         .def("num_vertices", &cumesh::CuMesh::num_vertices)
+         .def("num_faces", &cumesh::CuMesh::num_faces)
+diff --git a/src/t2r_alloc.h b/src/t2r_alloc.h
+new file mode 100644
+index 0000000..0d1de42
+--- /dev/null
++++ b/src/t2r_alloc.h
+@@ -0,0 +1,18 @@
++// t2r build of CuMesh: route device allocations through PyTorch's HIP caching allocator. CuMesh allocates and frees
++// scratch buffers inside every simplify / chart / remesh iteration, and hipMalloc/hipFree are synchronous and slow on
++// ROCm. Allocation does not affect any arithmetic, so results are unchanged.
++#pragma once
++#if defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM)
++#include <hip/hip_runtime.h>
++#include <c10/hip/HIPCachingAllocator.h>
++static inline hipError_t t2r_hip_malloc(void** p, size_t n) {
++  *p = n ? c10::cuda::CUDACachingAllocator::raw_alloc(n) : nullptr;
++  return hipSuccess;
++}
++static inline hipError_t t2r_hip_free(void* p) {
++  if (p) c10::cuda::CUDACachingAllocator::raw_delete(p);
++  return hipSuccess;
++}
++#define hipMalloc(p, n) t2r_hip_malloc((void**)(p), (n))
++#define hipFree(p) t2r_hip_free((void*)(p))
++#endif
+diff --git a/src/utils.h b/src/utils.h
+index aeaf2d8..98fd1fd 100644
+--- a/src/utils.h
++++ b/src/utils.h
+@@ -26,6 +26,14 @@ namespace cumesh {
+ /**
+  * A GPU buffer class that manages device memory.
+  */
++#if defined(__CUDACC__) || defined(__HIPCC__)
++template <typename T>
++__global__ void t2r_fill_kernel(T* p, size_t n, T v) {
++    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
++    if (i < n) p[i] = v;
++}
++#endif
++
+ template<typename T>
+ struct Buffer {
+     T* ptr;
+@@ -84,9 +92,16 @@ struct Buffer {
+ 
+     void fill(T val) {
+         cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
++#if defined(__CUDACC__) || defined(__HIPCC__)
++        // t2r: fill on the device (upstream builds a host vector of `size` elements and does a synchronous pageable
++        // host-to-device copy on every call, ~300 MB per call on large meshes).
++        if (size) t2r_fill_kernel<T><<<(unsigned)((size + 255) / 256), 256, 0, stream>>>(ptr, size, val);
++        CUDA_CHECK(cudaGetLastError());
++#else
+         std::vector<T> tmp(size, val);
+         CUDA_CHECK(cudaMemcpyAsync(ptr, tmp.data(), size * sizeof(T), cudaMemcpyHostToDevice, stream));
+         CUDA_CHECK(cudaStreamSynchronize(stream));
++#endif
+     }
+ };
+ 
+diff --git a/cumesh/__init__.py b/t2r_cumesh/__init__.py
+similarity index 100%
+rename from cumesh/__init__.py
+rename to t2r_cumesh/__init__.py
+diff --git a/cumesh/bvh.py b/t2r_cumesh/bvh.py
+similarity index 100%
+rename from cumesh/bvh.py
+rename to t2r_cumesh/bvh.py
+diff --git a/cumesh/cumesh.py b/t2r_cumesh/cumesh.py
+similarity index 100%
+rename from cumesh/cumesh.py
+rename to t2r_cumesh/cumesh.py
+diff --git a/cumesh/remeshing.py b/t2r_cumesh/remeshing.py
+similarity index 100%
+rename from cumesh/remeshing.py
+rename to t2r_cumesh/remeshing.py
+diff --git a/cumesh/xatlas.py b/t2r_cumesh/xatlas.py
+similarity index 100%
+rename from cumesh/xatlas.py
+rename to t2r_cumesh/xatlas.py
+diff --git a/third_party/cubvh b/third_party/cubvh
+--- a/third_party/cubvh
++++ b/third_party/cubvh
+@@ -1 +1 @@
+-Subproject commit ce92267a24ef6ad7d2c8ccbc2ae2c021a6597e70
++Subproject commit ce92267a24ef6ad7d2c8ccbc2ae2c021a6597e70-dirty
+diff --git a/third_party/xatlas/binding.cpp b/third_party/xatlas/binding.cpp
+index ec60654..9cfbc8f 100644
+--- a/third_party/xatlas/binding.cpp
++++ b/third_party/xatlas/binding.cpp
+@@ -151,7 +151,7 @@ public:
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.doc() = "xatlas wrapper for PyTorch";
+ 
+-    py::class_<cumesh_xatlas::ChartOptions>(m, "ChartOptions")
++    py::class_<cumesh_xatlas::ChartOptions>(m, "ChartOptions", py::module_local())
+         .def(py::init<>())
+         .def_readwrite("max_chart_area", &cumesh_xatlas::ChartOptions::maxChartArea)
+         .def_readwrite("max_boundary_length", &cumesh_xatlas::ChartOptions::maxBoundaryLength)
+@@ -165,7 +165,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+         .def_readwrite("use_input_mesh_uvs", &cumesh_xatlas::ChartOptions::useInputMeshUvs)
+         .def_readwrite("fix_winding", &cumesh_xatlas::ChartOptions::fixWinding);
+ 
+-    py::class_<cumesh_xatlas::PackOptions>(m, "PackOptions")
++    py::class_<cumesh_xatlas::PackOptions>(m, "PackOptions", py::module_local())
+         .def(py::init<>())
+         .def_readwrite("max_chart_size", &cumesh_xatlas::PackOptions::maxChartSize)
+         .def_readwrite("padding", &cumesh_xatlas::PackOptions::padding)
+@@ -177,7 +177,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+         .def_readwrite("rotate_charts", &cumesh_xatlas::PackOptions::rotateCharts)
+         .def_readwrite("rotate_charts_to_axis", &cumesh_xatlas::PackOptions::rotateChartsToAxis);
+ 
+-    py::class_<cumesh_xatlas::XAtlasWrapper>(m, "Atlas")
++    py::class_<cumesh_xatlas::XAtlasWrapper>(m, "Atlas", py::module_local())
+         .def(py::init<>())
+         .def("add_mesh", &cumesh_xatlas::XAtlasWrapper::AddMesh)
+         .def("compute_charts", &cumesh_xatlas::XAtlasWrapper::ComputeCharts)

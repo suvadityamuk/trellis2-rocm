@@ -1,0 +1,31 @@
+diff --git a/src/bindings.cpp b/src/bindings.cpp
+index 0485adc..e724313 100644
+--- a/src/bindings.cpp
++++ b/src/bindings.cpp
+@@ -14,7 +14,7 @@ using namespace cumesh::cubvh;
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+ 
+ // CUDA API
+-py::class_<cuBVH>(m, "cuBVH")
++py::class_<cuBVH>(m, "cuBVH", py::module_local())
+     .def("ray_trace", &cuBVH::ray_trace)
+     .def("unsigned_distance", &cuBVH::unsigned_distance)
+     .def("signed_distance", &cuBVH::signed_distance);
+@@ -30,7 +30,7 @@ m.def("sparse_marching_cubes", &sparse_marching_cubes,
+ );
+ 
+ // GPU Hash Table bindings
+-py::class_<cuHashTable>(m, "cuHashTable")
++py::class_<cuHashTable>(m, "cuHashTable", py::module_local())
+     .def("set_num_dims", &cuHashTable::set_num_dims)
+     .def("get_num_dims", &cuHashTable::get_num_dims)
+     .def("resize", &cuHashTable::resize)
+@@ -73,7 +73,7 @@ m.def("parallel_decimate", &parallel_decimate,
+ );
+ 
+ // CPU Hash Table bindings
+-py::class_<HashTable>(m, "HashTable")
++py::class_<HashTable>(m, "HashTable", py::module_local())
+     .def(py::init<>())
+     .def("set_num_dims", &HashTable::set_num_dims)
+     .def("get_num_dims", &HashTable::get_num_dims)

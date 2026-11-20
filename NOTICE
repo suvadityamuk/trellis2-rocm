@@ -1,0 +1,24 @@
+trellis2-rocm
+Copyright 2026 Suvaditya Mukherjee
+
+This product includes software derived from the following projects:
+
+- trellis2-cuda (https://github.com/suvadityamuk/trellis2-cuda), Apache License 2.0: the LBVH and TELEA kernels
+  (csrc/lbvh.hip, csrc/telea.hip and their copies in hub/trellis2-rocm) are adapted from it.
+- OpenCV (https://github.com/opencv/opencv), Apache License 2.0: the TELEA weighting in csrc/telea.hip follows
+  modules/photo/src/inpaint.cpp (INPAINT_TELEA).
+- xatlas (https://github.com/jpcy/xatlas), MIT License: vendored in csrc/third_party/xatlas and
+  hub/trellis2-rocm/trellis2_rocm/xatlas, with its namespace renamed and a thread-count override added.
+- FlexGEMM (https://github.com/JeffreyXiang/FlexGEMM), MIT License: csrc/grid_sample.hip reproduces its trilinear
+  weighted-sum kernel.
+- TRELLIS.2 (https://github.com/microsoft/TRELLIS.2), MIT License: the pipeline, model architectures and
+  post-processing reproduced by this project.
+
+patches/ holds diffs against CuMesh (https://github.com/JeffreyXiang/CuMesh, MIT License), its cuBVH submodule and
+nvdiffrast (https://github.com/NVlabs/nvdiffrast, NVIDIA Source Code License, non-commercial). The patched lines
+remain under the licenses of those projects.
+
+Third-party sources fetched by tools/setup_rocm.sh (TRELLIS.2, flash-attention, FlexGEMM, CuMesh, cuBVH, nvdiffrast)
+are not redistributed here and remain under their own licenses. nvdiffrast and parts of cuBVH are under NVIDIA's
+non-commercial source code license, so an environment built by that script is subject to those terms. The Hub
+kernels in hub/trellis2-rocm use neither.

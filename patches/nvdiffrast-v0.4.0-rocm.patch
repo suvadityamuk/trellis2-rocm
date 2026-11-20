@@ -1,0 +1,988 @@
+diff --git a/csrc/common/antialias.cu b/csrc/common/antialias.cu
+index 95cc3ba..4868f7d 100644
+--- a/csrc/common/antialias.cu
++++ b/csrc/common/antialias.cu
+@@ -405,7 +405,7 @@ __global__ void AntialiasGradKernel(const AntialiasKernelParams p)
+ 
+         // Read work item filled out by forward kernel.
+         int4 item = p.workBuffer[thread_idx + 1];
+-        unsigned int amask = __ballot_sync(0xffffffffu, item.w);
++        unsigned int amask = CR_BALLOT(0xffffffffu, item.w);
+         if (item.w == 0)
+             continue; // No effect.
+ 
+@@ -429,7 +429,7 @@ __global__ void AntialiasGradKernel(const AntialiasKernelParams p)
+ 
+         // Bail out if triangle index is corrupt.
+         bool triFail = (tri < 0 || tri >= p.numTriangles);
+-        amask = __ballot_sync(amask, !triFail);
++        amask = CR_BALLOT(amask, !triFail);
+         if (triFail)
+             continue;
+ 
+@@ -463,7 +463,7 @@ __global__ void AntialiasGradKernel(const AntialiasKernelParams p)
+ 
+         // If position weight is zero, skip the rest.
+         bool noGrad = (dd == 0.f);
+-        amask = __ballot_sync(amask, !noGrad);
++        amask = CR_BALLOT(amask, !noGrad);
+         if (noGrad)
+             continue;
+ 
+@@ -475,7 +475,7 @@ __global__ void AntialiasGradKernel(const AntialiasKernelParams p)
+ 
+         // Bail out if vertex indices are corrupt.
+         bool vtxFail = (vi1 < 0 || vi1 >= p.numVertices || vi2 < 0 || vi2 >= p.numVertices);
+-        amask = __ballot_sync(amask, !vtxFail);
++        amask = CR_BALLOT(amask, !vtxFail);
+         if (vtxFail)
+             continue;
+ 
+diff --git a/csrc/common/common.h b/csrc/common/common.h
+index 01ecf9f..86ed16e 100644
+--- a/csrc/common/common.h
++++ b/csrc/common/common.h
+@@ -9,6 +9,7 @@
+ #pragma once
+ #include <cuda.h>
+ #include <stdint.h>
++#include "cr_warp32.h"
+ 
+ //------------------------------------------------------------------------
+ // C++ helper function prototypes.
+diff --git a/csrc/common/cr_warp32.h b/csrc/common/cr_warp32.h
+new file mode 100644
+index 0000000..19cba20
+--- /dev/null
++++ b/csrc/common/cr_warp32.h
+@@ -0,0 +1,61 @@
++// ROCm port: 32-lane logical warps on 64-lane (CDNA) or 32-lane (RDNA) hardware wavefronts.
++//
++// The cudaraster / nvdiffrast kernels are written for 32-thread warps laid out as blockDim = (32, numWarps).
++// On wave64 hardware one wavefront holds two such logical warps (threadIdx.y = 2k, 2k+1). Every warp-level
++// primitive below acts only on the 32-lane half that the calling lane belongs to, so the two logical warps
++// sharing a wavefront never see each other's lanes. On wave32 hardware the half offset is always 0.
++#pragma once
++
++#if defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM)
++#include <hip/hip_runtime.h>
++#if defined(__HIPCC__)  // device helpers only; host-compiled .cpp files never use them
++
++__device__ __forceinline__ unsigned cr_lane32(void) { return __lane_id() & 31u; }
++__device__ __forceinline__ unsigned cr_half_base(void) { return __lane_id() & ~31u; }
++
++// 32-bit ballot over the caller's logical warp (inactive lanes contribute 0, as in CUDA).
++__device__ __forceinline__ unsigned cr_ballot32(int pred)
++{
++    unsigned long long b = __ballot(pred);
++    return (unsigned)(b >> cr_half_base());
++}
++__device__ __forceinline__ bool cr_any32(int pred) { return cr_ballot32(pred) != 0u; }
++__device__ __forceinline__ bool cr_all32(int pred) { return cr_ballot32(!pred) == 0u; }
++
++// width=32 shuffles stay inside the 32-lane half.
++template <class T> __device__ __forceinline__ T cr_shfl32(T v, int src) { return __shfl(v, src, 32); }
++template <class T> __device__ __forceinline__ T cr_shfl_xor32(T v, int m) { return __shfl_xor(v, m, 32); }
++template <class T> __device__ __forceinline__ T cr_shfl_up32(T v, unsigned d) { return __shfl_up(v, d, 32); }
++template <class T> __device__ __forceinline__ T cr_shfl_down32(T v, unsigned d) { return __shfl_down(v, d, 32); }
++
++// Lanes of a wavefront execute in lockstep; the fences keep the compiler from moving shared-memory
++// accesses across the point where CUDA code expects warp-level visibility.
++__device__ __forceinline__ void cr_syncwarp(void)
++{
++    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
++    __builtin_amdgcn_wave_barrier();
++    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
++}
++
++#define CR_BALLOT(mask, pred)       cr_ballot32(pred)
++#define CR_ANY(mask, pred)          cr_any32(pred)
++#define CR_ALL(mask, pred)          cr_all32(pred)
++#define CR_SHFL(mask, v, src)       cr_shfl32((v), (src))
++#define CR_SHFL_XOR(mask, v, m)     cr_shfl_xor32((v), (m))
++#define CR_SHFL_UP(mask, v, d)      cr_shfl_up32((v), (d))
++#define CR_SHFL_DOWN(mask, v, d)    cr_shfl_down32((v), (d))
++#define CR_SYNCWARP(...)            cr_syncwarp()
++#endif  // __HIPCC__
++
++#else  // CUDA
++
++#define CR_BALLOT(mask, pred)       __ballot_sync((mask), (pred))
++#define CR_ANY(mask, pred)          __any_sync((mask), (pred))
++#define CR_ALL(mask, pred)          __all_sync((mask), (pred))
++#define CR_SHFL(mask, v, src)       __shfl_sync((mask), (v), (src))
++#define CR_SHFL_XOR(mask, v, m)     __shfl_xor_sync((mask), (v), (m))
++#define CR_SHFL_UP(mask, v, d)      __shfl_up_sync((mask), (v), (d))
++#define CR_SHFL_DOWN(mask, v, d)    __shfl_down_sync((mask), (v), (d))
++#define CR_SYNCWARP(...)            __syncwarp(__VA_ARGS__)
++
++#endif
+diff --git a/csrc/common/cudaraster/CudaRaster.hpp b/csrc/common/craster/CudaRaster.hpp
+similarity index 100%
+rename from csrc/common/cudaraster/CudaRaster.hpp
+rename to csrc/common/craster/CudaRaster.hpp
+diff --git a/csrc/common/cudaraster/impl/BinRaster.inl b/csrc/common/craster/impl/BinRaster.inl
+similarity index 92%
+rename from csrc/common/cudaraster/impl/BinRaster.inl
+rename to csrc/common/craster/impl/BinRaster.inl
+index deae9d2..10beda8 100644
+--- a/csrc/common/cudaraster/impl/BinRaster.inl
++++ b/csrc/common/craster/impl/BinRaster.inl
+@@ -84,11 +84,11 @@ __device__ __inline__ void binRasterImpl(const CRParams p)
+                     num = triSubtris[triIdx];
+ 
+                 // cumulative sum of subtriangles within each warp
+-                U32 myIdx = __popc(__ballot_sync(~0u, num & 1) & getLaneMaskLt());
+-                if (__any_sync(~0u, num > 1))
++                U32 myIdx = __popc(CR_BALLOT(~0u, num & 1) & getLaneMaskLt());
++                if (CR_ANY(~0u, num > 1))
+                 {
+-                    myIdx += __popc(__ballot_sync(~0u, num & 2) & getLaneMaskLt()) * 2;
+-                    myIdx += __popc(__ballot_sync(~0u, num & 4) & getLaneMaskLt()) * 4;
++                    myIdx += __popc(CR_BALLOT(~0u, num & 2) & getLaneMaskLt()) * 2;
++                    myIdx += __popc(CR_BALLOT(~0u, num & 4) & getLaneMaskLt()) * 4;
+                 }
+                 if (threadIdx.x == 31) // Do not assume that last thread in warp wins the write.
+                     s_broadcast[threadIdx.y + 16] = myIdx + num;
+@@ -97,30 +97,30 @@ __device__ __inline__ void binRasterImpl(const CRParams p)
+                 // cumulative sum of per-warp subtriangle counts
+                 // Note: cannot have more than 32 warps or this needs to sync between each step.
+                 bool act = (thrInBlock < CR_BIN_WARPS);
+-                U32 actMask = __ballot_sync(~0u, act);
++                U32 actMask = CR_BALLOT(~0u, act);
+                 if (threadIdx.y == 0 && act)
+                 {
+                     volatile U32* ptr = &s_broadcast[thrInBlock + 16];
+                     U32 val = *ptr;
+                     #if (CR_BIN_WARPS > 1)
+-                        val += ptr[-1]; __syncwarp(actMask);
+-                        *ptr = val;     __syncwarp(actMask);
++                        val += ptr[-1]; CR_SYNCWARP(actMask);
++                        *ptr = val;     CR_SYNCWARP(actMask);
+                     #endif
+                     #if (CR_BIN_WARPS > 2)
+-                        val += ptr[-2]; __syncwarp(actMask);
+-                        *ptr = val;     __syncwarp(actMask);
++                        val += ptr[-2]; CR_SYNCWARP(actMask);
++                        *ptr = val;     CR_SYNCWARP(actMask);
+                     #endif
+                     #if (CR_BIN_WARPS > 4)
+-                        val += ptr[-4]; __syncwarp(actMask);
+-                        *ptr = val;     __syncwarp(actMask);
++                        val += ptr[-4]; CR_SYNCWARP(actMask);
++                        *ptr = val;     CR_SYNCWARP(actMask);
+                     #endif
+                     #if (CR_BIN_WARPS > 8)
+-                        val += ptr[-8]; __syncwarp(actMask);
+-                        *ptr = val;     __syncwarp(actMask);
++                        val += ptr[-8]; CR_SYNCWARP(actMask);
++                        *ptr = val;     CR_SYNCWARP(actMask);
+                     #endif
+                     #if (CR_BIN_WARPS > 16)
+-                        val += ptr[-16]; __syncwarp(actMask);
+-                        *ptr = val;      __syncwarp(actMask);
++                        val += ptr[-16]; CR_SYNCWARP(actMask);
++                        *ptr = val;      CR_SYNCWARP(actMask);
+                     #endif
+ 
+                     // initially assume that we consume everything
+@@ -172,7 +172,7 @@ __device__ __inline__ void binRasterImpl(const CRParams p)
+             // make every warp clear its output buffers
+             for (int i=threadIdx.x; i < p.numBins; i += 32)
+                 s_outMask[threadIdx.y][i] = 0;
+-            __syncwarp();
++            CR_SYNCWARP();
+ 
+             // choose our triangle
+             uint4 triData = make_uint4(0, 0, 0, 0);
+@@ -196,7 +196,7 @@ __device__ __inline__ void binRasterImpl(const CRParams p)
+             // setup bounding box and edge functions, and rasterize
+             S32 lox, loy, hix, hiy;
+             bool hasTri = (thrInBlock < bufCount);
+-            U32 hasTriMask = __ballot_sync(~0u, hasTri);
++            U32 hasTriMask = CR_BALLOT(~0u, hasTri);
+             if (hasTri)
+             {
+                 S32 v0x = add_s16lo_s16lo(triData.x, p.widthPixelsVp  * (CR_SUBPIXEL_SIZE >> 1));
+@@ -214,17 +214,17 @@ __device__ __inline__ void binRasterImpl(const CRParams p)
+                 U32 bit = 1 << threadIdx.x;
+ #if __CUDA_ARCH__ >= 700
+                 bool multi = (hix != lox || hiy != loy);
+-                if (!__any_sync(hasTriMask, multi))
++                if (!CR_ANY(hasTriMask, multi))
+                 {
+                     int binIdx = lox + p.widthBins * loy;
+                     U32 mask = __match_any_sync(hasTriMask, binIdx);
+                     s_outMask[threadIdx.y][binIdx] = mask;
+-                    __syncwarp(hasTriMask);
++                    CR_SYNCWARP(hasTriMask);
+                 } else
+ #endif
+                 {
+                     bool complex = (hix > lox+1 || hiy > loy+1);
+-                    if (!__any_sync(hasTriMask, complex))
++                    if (!CR_ANY(hasTriMask, complex))
+                     {
+                         int binIdx = lox + p.widthBins * loy;
+                         atomicOr((U32*)&s_outMask[threadIdx.y][binIdx], bit);
+@@ -276,7 +276,7 @@ __device__ __inline__ void binRasterImpl(const CRParams p)
+ 
+             int overIndex = -1;
+             bool act = (thrInBlock < p.numBins);
+-            U32 actMask = __ballot_sync(~0u, act);
++            U32 actMask = CR_BALLOT(~0u, act);
+             if (act)
+             {
+                 U8* srcPtr = (U8*)&s_outMask[0][thrInBlock];
+@@ -293,13 +293,13 @@ __device__ __inline__ void binRasterImpl(const CRParams p)
+                 // overflow => request a new segment
+                 int ofs = s_outOfs[thrInBlock];
+                 bool ovr = (((ofs - 1) >> CR_BIN_SEG_LOG2) != (((ofs - 1) + total) >> CR_BIN_SEG_LOG2));
+-                U32 ovrMask = __ballot_sync(actMask, ovr);
++                U32 ovrMask = CR_BALLOT(actMask, ovr);
+                 if (ovr)
+                 {
+                     overIndex = __popc(ovrMask & getLaneMaskLt());
+                     if (overIndex == 0)
+                         s_broadcast[threadIdx.y + 16] = atomicAdd((U32*)&s_overTotal, __popc(ovrMask));
+-                    __syncwarp(ovrMask);
++                    CR_SYNCWARP(ovrMask);
+                     overIndex += s_broadcast[threadIdx.y + 16];
+                     s_overIndex[thrInBlock] = overIndex;
+                 }
+diff --git a/csrc/common/cudaraster/impl/Buffer.cpp b/csrc/common/craster/impl/Buffer.cpp
+similarity index 100%
+rename from csrc/common/cudaraster/impl/Buffer.cpp
+rename to csrc/common/craster/impl/Buffer.cpp
+diff --git a/csrc/common/cudaraster/impl/Buffer.hpp b/csrc/common/craster/impl/Buffer.hpp
+similarity index 100%
+rename from csrc/common/cudaraster/impl/Buffer.hpp
+rename to csrc/common/craster/impl/Buffer.hpp
+diff --git a/csrc/common/cudaraster/impl/CoarseRaster.inl b/csrc/common/craster/impl/CoarseRaster.inl
+similarity index 89%
+rename from csrc/common/cudaraster/impl/CoarseRaster.inl
+rename to csrc/common/craster/impl/CoarseRaster.inl
+index a7081c7..89d55df 100644
+--- a/csrc/common/cudaraster/impl/CoarseRaster.inl
++++ b/csrc/common/craster/impl/CoarseRaster.inl
+@@ -151,7 +151,7 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p)
+                 // First warp: Choose the segment with the lowest initial triangle index.
+ 
+                 bool hasStream = (thrInBlock < CR_BIN_STREAMS_SIZE);
+-                U32 hasStreamMask = __ballot_sync(~0u, hasStream);
++                U32 hasStreamMask = CR_BALLOT(~0u, hasStream);
+                 if (hasStream)
+                 {
+                     // Find the stream with the lowest triangle index.
+@@ -161,26 +161,26 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p)
+                     volatile U32* v = &s_scanTemp[0][thrInBlock + 16];
+ 
+                     #if (CR_BIN_STREAMS_SIZE > 1)
+-                        v[0] = t; __syncwarp(hasStreamMask); t = ::min(t, v[-1]); __syncwarp(hasStreamMask);
++                        v[0] = t; CR_SYNCWARP(hasStreamMask); t = ::min(t, v[-1]); CR_SYNCWARP(hasStreamMask);
+                     #endif
+                     #if (CR_BIN_STREAMS_SIZE > 2)
+-                        v[0] = t; __syncwarp(hasStreamMask); t = ::min(t, v[-2]); __syncwarp(hasStreamMask);
++                        v[0] = t; CR_SYNCWARP(hasStreamMask); t = ::min(t, v[-2]); CR_SYNCWARP(hasStreamMask);
+                     #endif
+                     #if (CR_BIN_STREAMS_SIZE > 4)
+-                        v[0] = t; __syncwarp(hasStreamMask); t = ::min(t, v[-4]); __syncwarp(hasStreamMask);
++                        v[0] = t; CR_SYNCWARP(hasStreamMask); t = ::min(t, v[-4]); CR_SYNCWARP(hasStreamMask);
+                     #endif
+                     #if (CR_BIN_STREAMS_SIZE > 8)
+-                        v[0] = t; __syncwarp(hasStreamMask); t = ::min(t, v[-8]); __syncwarp(hasStreamMask);
++                        v[0] = t; CR_SYNCWARP(hasStreamMask); t = ::min(t, v[-8]); CR_SYNCWARP(hasStreamMask);
+                     #endif
+                     #if (CR_BIN_STREAMS_SIZE > 16)
+-                        v[0] = t; __syncwarp(hasStreamMask); t = ::min(t, v[-16]); __syncwarp(hasStreamMask);
++                        v[0] = t; CR_SYNCWARP(hasStreamMask); t = ::min(t, v[-16]); CR_SYNCWARP(hasStreamMask);
+                     #endif
+-                    v[0] = t; __syncwarp(hasStreamMask);
++                    v[0] = t; CR_SYNCWARP(hasStreamMask);
+ 
+                     // Consume and broadcast.
+ 
+                     bool first = (s_scanTemp[0][CR_BIN_STREAMS_SIZE - 1 + 16] == firstTri);
+-                    U32 firstMask = __ballot_sync(hasStreamMask, first);
++                    U32 firstMask = CR_BALLOT(hasStreamMask, first);
+                     if (first && (firstMask >> threadIdx.x) == 1u)
+                     {
+                         int segIdx = s_binStreamCurrSeg[thrInBlock];
+@@ -246,7 +246,7 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p)
+ 
+             // 32 triangles per warp: Record emits (= tile intersections).
+ 
+-            if (__any_sync(~0u, triIdx != -1))
++            if (CR_ANY(~0u, triIdx != -1))
+             {
+                 S32 v0x = sub_s16lo_s16lo(triData.x, originX);
+                 S32 v0y = sub_s16hi_s16lo(triData.x, originY);
+@@ -273,7 +273,7 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p)
+ 
+                 // Case A: All AABBs are small => record the full AABB using atomics.
+ 
+-                if (__all_sync(~0u, sizex <= 2 && sizey <= 2))
++                if (CR_ALL(~0u, sizex <= 2 && sizey <= 2))
+                 {
+                     if (triIdx != -1)
+                     {
+@@ -292,12 +292,12 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p)
+                         aabbMask = 0;
+ 
+                     volatile U32* v = &s_scanTemp[threadIdx.y][threadIdx.x + 16];
+-                    v[0] = aabbMask; __syncwarp(); aabbMask |= v[-1]; __syncwarp();
+-                    v[0] = aabbMask; __syncwarp(); aabbMask |= v[-2]; __syncwarp();
+-                    v[0] = aabbMask; __syncwarp(); aabbMask |= v[-4]; __syncwarp();
+-                    v[0] = aabbMask; __syncwarp(); aabbMask |= v[-8]; __syncwarp();
+-                    v[0] = aabbMask; __syncwarp(); aabbMask |= v[-16]; __syncwarp();
+-                    v[0] = aabbMask; __syncwarp(); aabbMask = s_scanTemp[threadIdx.y][47];
++                    v[0] = aabbMask; CR_SYNCWARP(); aabbMask |= v[-1]; CR_SYNCWARP();
++                    v[0] = aabbMask; CR_SYNCWARP(); aabbMask |= v[-2]; CR_SYNCWARP();
++                    v[0] = aabbMask; CR_SYNCWARP(); aabbMask |= v[-4]; CR_SYNCWARP();
++                    v[0] = aabbMask; CR_SYNCWARP(); aabbMask |= v[-8]; CR_SYNCWARP();
++                    v[0] = aabbMask; CR_SYNCWARP(); aabbMask |= v[-16]; CR_SYNCWARP();
++                    v[0] = aabbMask; CR_SYNCWARP(); aabbMask = s_scanTemp[threadIdx.y][47];
+ 
+                     U32 maskX = aabbMask & 0xFFFF;
+                     U32 maskY = aabbMask >> 16;
+@@ -326,26 +326,26 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p)
+                     d12x += sizex * d12y;
+ 
+                     // Case B: Warp-AABB is not much larger than largest AABB => Check tiles in warp-AABB, record using ballots.
+-                    if (__any_sync(~0u, warea * 4 <= area * 8))
++                    if (CR_ANY(~0u, warea * 4 <= area * 8))
+                     {
+                         // Not sure if this is any faster than Case C after all the post-Volta ballot mask tracking.
+                         bool act = (triIdx != -1);
+-                        U32 actMask = __ballot_sync(~0u, act);
++                        U32 actMask = CR_BALLOT(~0u, act);
+                         if (act)
+                         {
+                             for (int y = wloy; y <= whiy; y++)
+                             {
+                                 bool yIn = (y >= loy && y <= hiy);
+-                                U32 yMask = __ballot_sync(actMask, yIn);
++                                U32 yMask = CR_BALLOT(actMask, yIn);
+                                 if (yIn)
+                                 {
+                                     for (int x = wlox; x <= whix; x++)
+                                     {
+                                         bool xyIn = (x >= lox && x <= hix);
+-                                        U32 xyMask = __ballot_sync(yMask, xyIn);
++                                        U32 xyMask = CR_BALLOT(yMask, xyIn);
+                                         if (xyIn)
+                                         {
+-                                            U32 res = __ballot_sync(xyMask, b01 >= 0 && b02 >= 0 && b12 >= 0);
++                                            U32 res = CR_BALLOT(xyMask, b01 >= 0 && b02 >= 0 && b12 >= 0);
+                                             if (threadIdx.x == 31 - __clz(xyMask))
+                                                 *(U32*)currPtr = res;
+                                             currPtr += 4, b01 -= d01y, b02 += d02y, b12 -= d12y;
+@@ -391,7 +391,7 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p)
+             {
+                 int tileInBin = tileInBin_base + thrInBlock;
+                 bool act = (tileInBin < CR_BIN_SQR);
+-                U32 actMask = __ballot_sync(~0u, act);
++                U32 actMask = CR_BALLOT(~0u, act);
+                 if (act)
+                 {
+                     // Compute prefix sum of emits over warps.
+@@ -415,10 +415,10 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p)
+ 
+                     // All counters within the warp are small => compute prefix sum using ballot.
+ 
+-                    if (!__any_sync(actMask, tileEmits >= 2))
++                    if (!CR_ANY(actMask, tileEmits >= 2))
+                     {
+                         U32 m = getLaneMaskLe();
+-                        *v = (__popc(__ballot_sync(actMask, tileEmits & 1) & m) << emitShift) | __popc(__ballot_sync(actMask, tileAllocs & 1) & m);
++                        *v = (__popc(CR_BALLOT(actMask, tileEmits & 1) & m) << emitShift) | __popc(CR_BALLOT(actMask, tileAllocs & 1) & m);
+                     }
+ 
+                     // Otherwise => scan-32 within the warp.
+@@ -426,12 +426,12 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p)
+                     else
+                     {
+                         U32 sum = (tileEmits << emitShift) | tileAllocs;
+-                        *v = sum; __syncwarp(actMask); if (threadIdx.x >= 1)  sum += v[-1]; __syncwarp(actMask);
+-                        *v = sum; __syncwarp(actMask); if (threadIdx.x >= 2)  sum += v[-2]; __syncwarp(actMask);
+-                        *v = sum; __syncwarp(actMask); if (threadIdx.x >= 4)  sum += v[-4]; __syncwarp(actMask);
+-                        *v = sum; __syncwarp(actMask); if (threadIdx.x >= 8)  sum += v[-8]; __syncwarp(actMask);
+-                        *v = sum; __syncwarp(actMask); if (threadIdx.x >= 16) sum += v[-16]; __syncwarp(actMask);
+-                        *v = sum; __syncwarp(actMask);
++                        *v = sum; CR_SYNCWARP(actMask); if (threadIdx.x >= 1)  sum += v[-1]; CR_SYNCWARP(actMask);
++                        *v = sum; CR_SYNCWARP(actMask); if (threadIdx.x >= 2)  sum += v[-2]; CR_SYNCWARP(actMask);
++                        *v = sum; CR_SYNCWARP(actMask); if (threadIdx.x >= 4)  sum += v[-4]; CR_SYNCWARP(actMask);
++                        *v = sum; CR_SYNCWARP(actMask); if (threadIdx.x >= 8)  sum += v[-8]; CR_SYNCWARP(actMask);
++                        *v = sum; CR_SYNCWARP(actMask); if (threadIdx.x >= 16) sum += v[-16]; CR_SYNCWARP(actMask);
++                        *v = sum; CR_SYNCWARP(actMask);
+                     }
+                 }
+             }
+@@ -441,20 +441,20 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p)
+             __syncthreads();
+ 
+             bool scan8 = (thrInBlock < CR_BIN_SQR / 32);
+-            U32 scan8Mask = __ballot_sync(~0u, scan8);
++            U32 scan8Mask = CR_BALLOT(~0u, scan8);
+             if (scan8)
+             {
+                 int sum = s_tileEmitPrefixSum[(thrInBlock << 5) + 32];
+                 volatile U32* v = &s_scanTemp[0][thrInBlock + 16];
+-                v[0] = sum; __syncwarp(scan8Mask);
++                v[0] = sum; CR_SYNCWARP(scan8Mask);
+                 #if (CR_BIN_SQR > 1 * 32)
+-                    sum += v[-1]; __syncwarp(scan8Mask); v[0] = sum; __syncwarp(scan8Mask);
++                    sum += v[-1]; CR_SYNCWARP(scan8Mask); v[0] = sum; CR_SYNCWARP(scan8Mask);
+                 #endif
+                 #if (CR_BIN_SQR > 2 * 32)
+-                    sum += v[-2]; __syncwarp(scan8Mask); v[0] = sum; __syncwarp(scan8Mask);
++                    sum += v[-2]; CR_SYNCWARP(scan8Mask); v[0] = sum; CR_SYNCWARP(scan8Mask);
+                 #endif
+                 #if (CR_BIN_SQR > 4 * 32)
+-                    sum += v[-4]; __syncwarp(scan8Mask); v[0] = sum; __syncwarp(scan8Mask);
++                    sum += v[-4]; CR_SYNCWARP(scan8Mask); v[0] = sum; CR_SYNCWARP(scan8Mask);
+                 #endif
+             }
+ 
+@@ -654,7 +654,7 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p)
+         {
+             int tileInBin = tileInBin_base + thrInBlock;
+             bool act = (tileInBin < CR_BIN_SQR);
+-            U32 actMask = __ballot_sync(~0u, act);
++            U32 actMask = CR_BALLOT(~0u, act);
+             if (act)
+             {
+                 int tileX = tileInBin & (CR_BIN_SIZE - 1);
+@@ -676,7 +676,7 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p)
+                 if (segCount != 0)
+                     tileSegCount[segIdx] = segCount;
+ 
+-                U32 res = __ballot_sync(actMask, ofs >= 0 | force);
++                U32 res = CR_BALLOT(actMask, ofs >= 0 | force);
+                 if (threadIdx.x == 0)
+                     s_scanTemp[0][(tileInBin >> 5) + 16] = __popc(res);
+             }
+@@ -688,19 +688,19 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p)
+         __syncthreads();
+ 
+         bool scan8 = (thrInBlock < CR_BIN_SQR / 32);
+-        U32 scan8Mask = __ballot_sync(~0u, scan8);
++        U32 scan8Mask = CR_BALLOT(~0u, scan8);
+         if (scan8)
+         {
+             volatile U32* v = &s_scanTemp[0][thrInBlock + 16];
+             U32 sum = v[0];
+             #if (CR_BIN_SQR > 1 * 32)
+-                sum += v[-1]; __syncwarp(scan8Mask); v[0] = sum; __syncwarp(scan8Mask);
++                sum += v[-1]; CR_SYNCWARP(scan8Mask); v[0] = sum; CR_SYNCWARP(scan8Mask);
+             #endif
+             #if (CR_BIN_SQR > 2 * 32)
+-                sum += v[-2]; __syncwarp(scan8Mask); v[0] = sum; __syncwarp(scan8Mask);
++                sum += v[-2]; CR_SYNCWARP(scan8Mask); v[0] = sum; CR_SYNCWARP(scan8Mask);
+             #endif
+             #if (CR_BIN_SQR > 4 * 32)
+-                sum += v[-4]; __syncwarp(scan8Mask); v[0] = sum; __syncwarp(scan8Mask);
++                sum += v[-4]; CR_SYNCWARP(scan8Mask); v[0] = sum; CR_SYNCWARP(scan8Mask);
+             #endif
+ 
+             if (thrInBlock == CR_BIN_SQR / 32 - 1)
+@@ -715,7 +715,7 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p)
+         {
+             int tileInBin = tileInBin_base + thrInBlock;
+             bool act = (tileInBin < CR_BIN_SQR) && (s_tileStreamCurrOfs[tileInBin] >= 0);
+-            U32 actMask = __ballot_sync(~0u, act);
++            U32 actMask = CR_BALLOT(~0u, act);
+             if (act)
+             {
+                 int activeIdx = s_firstActiveIdx;
+diff --git a/csrc/common/cudaraster/impl/Constants.hpp b/csrc/common/craster/impl/Constants.hpp
+similarity index 100%
+rename from csrc/common/cudaraster/impl/Constants.hpp
+rename to csrc/common/craster/impl/Constants.hpp
+diff --git a/csrc/common/cudaraster/impl/CudaRaster.cpp b/csrc/common/craster/impl/CudaRaster.cpp
+similarity index 100%
+rename from csrc/common/cudaraster/impl/CudaRaster.cpp
+rename to csrc/common/craster/impl/CudaRaster.cpp
+diff --git a/csrc/common/cudaraster/impl/Defs.hpp b/csrc/common/craster/impl/Defs.hpp
+similarity index 96%
+rename from csrc/common/cudaraster/impl/Defs.hpp
+rename to csrc/common/craster/impl/Defs.hpp
+index 7aa7774..9f469ba 100644
+--- a/csrc/common/cudaraster/impl/Defs.hpp
++++ b/csrc/common/craster/impl/Defs.hpp
+@@ -7,7 +7,11 @@
+ // license agreement from NVIDIA CORPORATION is strictly prohibited.
+ 
+ #pragma once
++#if defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM)
++#include <hip/hip_runtime.h>
++#else
+ #include <cuda_runtime.h>
++#endif
+ #include <cstdint>
+ 
+ namespace CR
+diff --git a/csrc/common/cudaraster/impl/FineRaster.inl b/csrc/common/craster/impl/FineRaster.inl
+similarity index 88%
+rename from csrc/common/cudaraster/impl/FineRaster.inl
+rename to csrc/common/craster/impl/FineRaster.inl
+index 720e999..e893d86 100644
+--- a/csrc/common/cudaraster/impl/FineRaster.inl
++++ b/csrc/common/craster/impl/FineRaster.inl
+@@ -19,15 +19,15 @@ __device__ __inline__ void initTileZMax(U32& tileZMax, bool& tileZUpd, volatile
+ __device__ __inline__ void updateTileZMax(U32& tileZMax, bool& tileZUpd, volatile U32* tileDepth, volatile U32* temp)
+ {
+     // Entry is warp-coherent.
+-    if (__any_sync(~0u, tileZUpd))
++    if (CR_ANY(~0u, tileZUpd))
+     {
+-        U32 z = ::max(tileDepth[threadIdx.x], tileDepth[threadIdx.x + 32]); __syncwarp();
+-        temp[threadIdx.x + 16] = z; __syncwarp();
+-        z = ::max(z, temp[threadIdx.x + 16 -  1]); __syncwarp(); temp[threadIdx.x + 16] = z; __syncwarp();
+-        z = ::max(z, temp[threadIdx.x + 16 -  2]); __syncwarp(); temp[threadIdx.x + 16] = z; __syncwarp();
+-        z = ::max(z, temp[threadIdx.x + 16 -  4]); __syncwarp(); temp[threadIdx.x + 16] = z; __syncwarp();
+-        z = ::max(z, temp[threadIdx.x + 16 -  8]); __syncwarp(); temp[threadIdx.x + 16] = z; __syncwarp();
+-        z = ::max(z, temp[threadIdx.x + 16 - 16]); __syncwarp(); temp[threadIdx.x + 16] = z; __syncwarp();
++        U32 z = ::max(tileDepth[threadIdx.x], tileDepth[threadIdx.x + 32]); CR_SYNCWARP();
++        temp[threadIdx.x + 16] = z; CR_SYNCWARP();
++        z = ::max(z, temp[threadIdx.x + 16 -  1]); CR_SYNCWARP(); temp[threadIdx.x + 16] = z; CR_SYNCWARP();
++        z = ::max(z, temp[threadIdx.x + 16 -  2]); CR_SYNCWARP(); temp[threadIdx.x + 16] = z; CR_SYNCWARP();
++        z = ::max(z, temp[threadIdx.x + 16 -  4]); CR_SYNCWARP(); temp[threadIdx.x + 16] = z; CR_SYNCWARP();
++        z = ::max(z, temp[threadIdx.x + 16 -  8]); CR_SYNCWARP(); temp[threadIdx.x + 16] = z; CR_SYNCWARP();
++        z = ::max(z, temp[threadIdx.x + 16 - 16]); CR_SYNCWARP(); temp[threadIdx.x + 16] = z; CR_SYNCWARP();
+         tileZMax = temp[47];
+         tileZUpd = false;
+     }
+@@ -104,13 +104,13 @@ __device__ __inline__ U64 trianglePixelCoverage(const CRParams& p, const uint4&
+ 
+ __device__ __inline__ U32 scan32_value(U32 value, volatile U32* temp)
+ {
+-    __syncwarp();
+-    temp[threadIdx.x + 16] = value; __syncwarp();
+-    value += temp[threadIdx.x + 16 -  1]; __syncwarp(); temp[threadIdx.x + 16] = value; __syncwarp();
+-    value += temp[threadIdx.x + 16 -  2]; __syncwarp(); temp[threadIdx.x + 16] = value; __syncwarp();
+-    value += temp[threadIdx.x + 16 -  4]; __syncwarp(); temp[threadIdx.x + 16] = value; __syncwarp();
+-    value += temp[threadIdx.x + 16 -  8]; __syncwarp(); temp[threadIdx.x + 16] = value; __syncwarp();
+-    value += temp[threadIdx.x + 16 - 16]; __syncwarp(); temp[threadIdx.x + 16] = value; __syncwarp();
++    CR_SYNCWARP();
++    temp[threadIdx.x + 16] = value; CR_SYNCWARP();
++    value += temp[threadIdx.x + 16 -  1]; CR_SYNCWARP(); temp[threadIdx.x + 16] = value; CR_SYNCWARP();
++    value += temp[threadIdx.x + 16 -  2]; CR_SYNCWARP(); temp[threadIdx.x + 16] = value; CR_SYNCWARP();
++    value += temp[threadIdx.x + 16 -  4]; CR_SYNCWARP(); temp[threadIdx.x + 16] = value; CR_SYNCWARP();
++    value += temp[threadIdx.x + 16 -  8]; CR_SYNCWARP(); temp[threadIdx.x + 16] = value; CR_SYNCWARP();
++    value += temp[threadIdx.x + 16 - 16]; CR_SYNCWARP(); temp[threadIdx.x + 16] = value; CR_SYNCWARP();
+     return value;
+ }
+ 
+@@ -152,22 +152,22 @@ __device__ __inline__ S32 findBit(U64 mask, int idx)
+ __device__ __inline__ void executeROP(U32 color, U32 depth, volatile U32* pColor, volatile U32* pDepth, U32 ropMask)
+ {
+     atomicMin((U32*)pDepth, depth);
+-    __syncwarp(ropMask);
++    CR_SYNCWARP(ropMask);
+     bool act = (depth == *pDepth);
+-    __syncwarp(ropMask);
+-    U32 actMask = __ballot_sync(ropMask, act);
++    CR_SYNCWARP(ropMask);
++    U32 actMask = CR_BALLOT(ropMask, act);
+     if (act)
+     {
+         *pDepth = 0;
+-        __syncwarp(actMask);
++        CR_SYNCWARP(actMask);
+         atomicMax((U32*)pDepth, threadIdx.x);
+-        __syncwarp(actMask);
++        CR_SYNCWARP(actMask);
+         if (*pDepth == threadIdx.x)
+         {
+             *pDepth = depth;
+             *pColor = color;
+         }
+-        __syncwarp(actMask);
++        CR_SYNCWARP(actMask);
+     }
+ }
+ 
+@@ -213,7 +213,7 @@ __device__ __inline__ void fineRasterImpl(const CRParams p)
+         // pick a tile
+         if (threadIdx.x == 0)
+             temp[16] = atomicAdd(&atomics.fineCounter, 1);
+-        __syncwarp();
++        CR_SYNCWARP();
+         int activeIdx = temp[16];
+         if (activeIdx >= atomics.numActiveTiles)
+             break;
+@@ -292,7 +292,7 @@ __device__ __inline__ void fineRasterImpl(const CRParams p)
+                     fragWrite += scan32_total(temp);
+ 
+                     // queue non-empty triangles
+-                    U32 goodMask = __ballot_sync(~0u, pop != 0);
++                    U32 goodMask = CR_BALLOT(~0u, pop != 0);
+                     if (pop != 0)
+                     {
+                         int idx = (triWrite + __popc(goodMask & getLaneMaskLt())) & 63;
+@@ -304,7 +304,7 @@ __device__ __inline__ void fineRasterImpl(const CRParams p)
+                 }
+                 while (fragWrite - fragRead < 32 && segment >= 0);
+             }
+-            __syncwarp();
++            CR_SYNCWARP();
+ 
+             // end of segment?
+             if (fragRead == fragWrite)
+@@ -312,7 +312,7 @@ __device__ __inline__ void fineRasterImpl(const CRParams p)
+ 
+             // clear triangle boundaries
+             temp[threadIdx.x + 16] = 0;
+-            __syncwarp();
++            CR_SYNCWARP();
+ 
+             // tag triangle boundaries
+             if (triRead + threadIdx.x < triWrite)
+@@ -321,14 +321,14 @@ __device__ __inline__ void fineRasterImpl(const CRParams p)
+                 if (idx <= 32)
+                     temp[idx + 16 - 1] = 1;
+             }
+-            __syncwarp();
++            CR_SYNCWARP();
+ 
+             int ropLaneIdx = threadIdx.x;
+-            U32 boundaryMask = __ballot_sync(~0u, temp[ropLaneIdx + 16]);
++            U32 boundaryMask = CR_BALLOT(~0u, temp[ropLaneIdx + 16]);
+ 
+             // distribute fragments
+             bool hasFragment = (ropLaneIdx < fragWrite - fragRead);
+-            U32 fragmentMask = __ballot_sync(~0u, hasFragment);
++            U32 fragmentMask = CR_BALLOT(~0u, hasFragment);
+             if (hasFragment)
+             {
+                 int triBufIdx = (triRead + __popc(boundaryMask & getLaneMaskLt())) & 63;
+@@ -356,7 +356,7 @@ __device__ __inline__ void fineRasterImpl(const CRParams p)
+                         tileZUpd = true; // we are replacing previous zmax => need to update
+                 }
+ 
+-                U32 ropMask = __ballot_sync(fragmentMask, !zkill);
++                U32 ropMask = CR_BALLOT(fragmentMask, !zkill);
+                 if (!zkill)
+ 					executeROP(td.w, depth, &tileColor[pixelInTile], &tileDepth[pixelInTile], ropMask);
+             }
+diff --git a/csrc/common/cudaraster/impl/PrivateDefs.hpp b/csrc/common/craster/impl/PrivateDefs.hpp
+similarity index 100%
+rename from csrc/common/cudaraster/impl/PrivateDefs.hpp
+rename to csrc/common/craster/impl/PrivateDefs.hpp
+diff --git a/csrc/common/cudaraster/impl/RasterImpl.cpp b/csrc/common/craster/impl/RasterImpl.cpp
+similarity index 100%
+rename from csrc/common/cudaraster/impl/RasterImpl.cpp
+rename to csrc/common/craster/impl/RasterImpl.cpp
+diff --git a/csrc/common/cudaraster/impl/RasterImpl.hpp b/csrc/common/craster/impl/RasterImpl.hpp
+similarity index 100%
+rename from csrc/common/cudaraster/impl/RasterImpl.hpp
+rename to csrc/common/craster/impl/RasterImpl.hpp
+diff --git a/csrc/common/cudaraster/impl/RasterImpl_kernel.cu b/csrc/common/craster/impl/RasterImpl_kernel.cu
+similarity index 100%
+rename from csrc/common/cudaraster/impl/RasterImpl_kernel.cu
+rename to csrc/common/craster/impl/RasterImpl_kernel.cu
+diff --git a/csrc/common/cudaraster/impl/TriangleSetup.inl b/csrc/common/craster/impl/TriangleSetup.inl
+similarity index 100%
+rename from csrc/common/cudaraster/impl/TriangleSetup.inl
+rename to csrc/common/craster/impl/TriangleSetup.inl
+diff --git a/csrc/common/cudaraster/impl/Util.inl b/csrc/common/craster/impl/Util.inl
+similarity index 72%
+rename from csrc/common/cudaraster/impl/Util.inl
+rename to csrc/common/craster/impl/Util.inl
+index f8faeba..6445301 100644
+--- a/csrc/common/cudaraster/impl/Util.inl
++++ b/csrc/common/craster/impl/Util.inl
+@@ -6,12 +6,105 @@
+ // distribution of this software and related documentation without an express
+ // license agreement from NVIDIA CORPORATION is strictly prohibited.
+ 
+-#include "PrivateDefs.hpp"
++// PrivateDefs.hpp is included by RasterImpl_kernel.cu before this file.
++#include "../../cr_warp32.h"
+ 
+ namespace CR
+ {
+ //------------------------------------------------------------------------
+ 
++#if defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM)
++template<class T> __device__ __inline__ void swap(T& a, T& b)               { T t = a; a = b; b = t; }
++
++// ROCm port of the PTX helpers. Each matches the PTX ISA semantics of the instruction it replaces.
++__device__ __inline__ U32   getLo                   (U64 a)                 { return (U32)a; }
++__device__ __inline__ S32   getLo                   (S64 a)                 { return (S32)(U32)(U64)a; }
++__device__ __inline__ U32   getHi                   (U64 a)                 { return (U32)(a >> 32); }
++__device__ __inline__ S32   getHi                   (S64 a)                 { return (S32)(U32)((U64)a >> 32); }
++__device__ __inline__ U64   combineLoHi             (U32 lo, U32 hi)        { return ((U64)hi << 32) | (U64)lo; }
++__device__ __inline__ S64   combineLoHi             (S32 lo, S32 hi)        { return (S64)(((U64)(U32)hi << 32) | (U64)(U32)lo); }
++// %lanemask_* relative to the 32-lane logical warp (see cr_warp32.h).
++__device__ __inline__ U32   getLaneMaskLt           (void)                  { return (1u << cr_lane32()) - 1u; }
++__device__ __inline__ U32   getLaneMaskLe           (void)                  { return (U32)((2ull << cr_lane32()) - 1ull); }
++__device__ __inline__ U32   getLaneMaskGt           (void)                  { return ~getLaneMaskLe(); }
++__device__ __inline__ U32   getLaneMaskGe           (void)                  { return ~getLaneMaskLt(); }
++// bfind.u32: bit position of the most significant 1, 0xFFFFFFFF (-1) for 0.
++__device__ __inline__ int   findLeadingOne          (U32 v)                 { return v ? 31 - __clz((int)v) : -1; }
++__device__ __inline__ bool  singleLane              (void)                  { return ((cr_ballot32(true) & getLaneMaskLt()) == 0); }
++
++__device__ __inline__ void  add_add_carry           (U32& rlo, U32 alo, U32 blo, U32& rhi, U32 ahi, U32 bhi) { U64 r = combineLoHi(alo, ahi) + combineLoHi(blo, bhi); rlo = getLo(r); rhi = getHi(r); }
++// cvt.rni.sat / cvt.rmi.sat: round (nearest-even / toward -inf), clamp to the destination range, NaN -> 0.
++__device__ __inline__ S32   f32_to_s32_sat          (F32 a)                 { if (a != a) return 0; F32 r = rintf(a); return r >= 2147483648.f ? 0x7fffffff : (r <= -2147483648.f ? (S32)0x80000000 : (S32)r); }
++__device__ __inline__ U32   f32_to_u32_sat          (F32 a)                 { if (a != a) return 0; F32 r = rintf(a); return r >= 4294967296.f ? 0xffffffffu : (r <= 0.f ? 0u : (U32)r); }
++__device__ __inline__ U32   f32_to_u32_sat_rmi      (F32 a)                 { if (a != a) return 0; F32 r = floorf(a); return r >= 4294967296.f ? 0xffffffffu : (r <= 0.f ? 0u : (U32)r); }
++__device__ __inline__ U32   f32_to_u8_sat           (F32 a)                 { if (a != a) return 0; F32 r = rintf(a); return r >= 255.f ? 255u : (r <= 0.f ? 0u : (U32)r); }
++__device__ __inline__ S64   f32_to_s64              (F32 a)                 { return (S64)rintf(a); }
++// vadd/vsub with .h0/.h1 operand selectors: signed types sign-extend the halfword, unsigned zero-extend.
++__device__ __inline__ S32   s16lo                   (S32 a)                 { return (S32)(S16)(a & 0xffff); }
++__device__ __inline__ S32   s16hi                   (S32 a)                 { return a >> 16; }
++__device__ __inline__ S32   add_s16lo_s16lo			(S32 a, S32 b)			{ return s16lo(a) + s16lo(b); }
++__device__ __inline__ S32   add_s16hi_s16lo			(S32 a, S32 b)			{ return s16hi(a) + s16lo(b); }
++__device__ __inline__ S32   add_s16lo_s16hi			(S32 a, S32 b)			{ return s16lo(a) + s16hi(b); }
++__device__ __inline__ S32   add_s16hi_s16hi			(S32 a, S32 b)			{ return s16hi(a) + s16hi(b); }
++__device__ __inline__ S32   sub_s16lo_s16lo			(S32 a, S32 b)			{ return s16lo(a) - s16lo(b); }
++__device__ __inline__ S32   sub_s16hi_s16lo			(S32 a, S32 b)			{ return s16hi(a) - s16lo(b); }
++__device__ __inline__ S32   sub_s16lo_s16hi			(S32 a, S32 b)			{ return s16lo(a) - s16hi(b); }
++__device__ __inline__ S32   sub_s16hi_s16hi			(S32 a, S32 b)			{ return s16hi(a) - s16hi(b); }
++__device__ __inline__ S32   sub_u16lo_u16lo			(U32 a, U32 b)			{ return (S32)(a & 0xffff) - (S32)(b & 0xffff); }
++__device__ __inline__ S32   sub_u16hi_u16lo			(U32 a, U32 b)			{ return (S32)(a >> 16) - (S32)(b & 0xffff); }
++__device__ __inline__ S32   sub_u16lo_u16hi			(U32 a, U32 b)			{ return (S32)(a & 0xffff) - (S32)(b >> 16); }
++__device__ __inline__ S32   sub_u16hi_u16hi			(U32 a, U32 b)			{ return (S32)(a >> 16) - (S32)(b >> 16); }
++__device__ __inline__ U32   ubyte                   (U32 a, int i)          { return (a >> (8 * i)) & 0xff; }
++__device__ __inline__ U32   add_b0					(U32 a, U32 b)			{ return ubyte(a, 0) + b; }
++__device__ __inline__ U32   add_b1					(U32 a, U32 b)			{ return ubyte(a, 1) + b; }
++__device__ __inline__ U32   add_b2					(U32 a, U32 b)			{ return ubyte(a, 2) + b; }
++__device__ __inline__ U32   add_b3					(U32 a, U32 b)			{ return ubyte(a, 3) + b; }
++__device__ __inline__ U32   vmad_b0					(U32 a, U32 b, U32 c)	{ return ubyte(a, 0) * b + c; }
++__device__ __inline__ U32   vmad_b1					(U32 a, U32 b, U32 c)	{ return ubyte(a, 1) * b + c; }
++__device__ __inline__ U32   vmad_b2					(U32 a, U32 b, U32 c)	{ return ubyte(a, 2) * b + c; }
++__device__ __inline__ U32   vmad_b3					(U32 a, U32 b, U32 c)	{ return ubyte(a, 3) * b + c; }
++__device__ __inline__ U32   vmad_b0_b3				(U32 a, U32 b, U32 c)	{ return ubyte(a, 0) * ubyte(b, 3) + c; }
++__device__ __inline__ U32   vmad_b1_b3				(U32 a, U32 b, U32 c)	{ return ubyte(a, 1) * ubyte(b, 3) + c; }
++__device__ __inline__ U32   vmad_b2_b3				(U32 a, U32 b, U32 c)	{ return ubyte(a, 2) * ubyte(b, 3) + c; }
++__device__ __inline__ U32   vmad_b3_b3				(U32 a, U32 b, U32 c)	{ return ubyte(a, 3) * ubyte(b, 3) + c; }
++// Sub-word destination (%0.b0): the result byte is merged into c (here c = 0).
++__device__ __inline__ U32   add_mask8				(U32 a, U32 b)			{ return (a + b) & 0xff; }
++__device__ __inline__ U32   sub_mask8				(U32 a, U32 b)			{ return (a - b) & 0xff; }
++__device__ __inline__ S32   max_max					(S32 a, S32 b, S32 c)	{ return ::max(::max(a, b), c); }
++__device__ __inline__ S32   min_min					(S32 a, S32 b, S32 c)	{ return ::min(::min(a, b), c); }
++__device__ __inline__ S32   max_add					(S32 a, S32 b, S32 c)	{ return ::max(a, b) + c; }
++__device__ __inline__ S32   min_add					(S32 a, S32 b, S32 c)	{ return ::min(a, b) + c; }
++__device__ __inline__ U32   add_add					(U32 a, U32 b, U32 c)	{ return a + b + c; }
++__device__ __inline__ U32   sub_add					(U32 a, U32 b, U32 c)	{ return a - b + c; }
++__device__ __inline__ U32   add_sub					(U32 a, U32 b, U32 c)	{ return a - c + b; }
++// vadd.u32.s32.s32.sat.min: clamp the (exact) sum to [0, 2^32-1], then unsigned min with c.
++__device__ __inline__ S32   add_clamp_0_x			(S32 a, S32 b, S32 c)	{ S64 r = (S64)a + (S64)b; U32 t = r < 0 ? 0u : (r > 0xffffffffll ? 0xffffffffu : (U32)r); return (S32)::min(t, (U32)c); }
++// vadd.u32.s32.s32.sat %0.bN: sum clamped to the unsigned byte range, merged into byte N of c.
++__device__ __inline__ S32   add_clamp_b0			(S32 a, S32 b, S32 c)	{ S64 r = (S64)a + (S64)b; U32 t = r < 0 ? 0u : (r > 255 ? 255u : (U32)r); return (S32)(((U32)c & ~0xffu) | t); }
++__device__ __inline__ S32   add_clamp_b2			(S32 a, S32 b, S32 c)	{ S64 r = (S64)a + (S64)b; U32 t = r < 0 ? 0u : (r > 255 ? 255u : (U32)r); return (S32)(((U32)c & ~0xff0000u) | (t << 16)); }
++// prmt.b32 (default mode): selector nibble bits 0-2 pick a byte of {b:a}, bit 3 replicates that byte's sign bit.
++__device__ __inline__ U32   prmt					(U32 a, U32 b, U32 c)
++{
++    U64 ab = ((U64)b << 32) | a; U32 r = 0;
++    for (int i = 0; i < 4; i++) {
++        U32 sel = (c >> (4 * i)) & 0xf;
++        U32 byte = (U32)(ab >> (8 * (sel & 7))) & 0xff;
++        if (sel & 8) byte = (byte & 0x80) ? 0xff : 0x00;
++        r |= byte << (8 * i);
++    }
++    return r;
++}
++__device__ __inline__ S32   u32lo_sext              (U32 a)                 { return (S32)(S16)(a & 0xffff); }
++// slct.dtype.s32 d, a, b, c: d = (c >= 0) ? a : b
++__device__ __inline__ U32   slct                    (U32 a, U32 b, S32 c)   { return c >= 0 ? a : b; }
++__device__ __inline__ S32   slct                    (S32 a, S32 b, S32 c)   { return c >= 0 ? a : b; }
++__device__ __inline__ F32   slct                    (F32 a, F32 b, S32 c)   { return c >= 0 ? a : b; }
++// set.ge.u32.s32 yields all ones for true.
++__device__ __inline__ U32   isetge                  (S32 a, S32 b)          { return a >= b ? 0xffffffffu : 0u; }
++__device__ __inline__ F64   rcp_approx              (F64 a)                 { return 1.0 / a; }
++// fma.rm.f32: a*b is exact in double; round the double sum toward -inf (only toABGR uses this).
++__device__ __inline__ F32   fma_rm                  (F32 a, F32 b, F32 c)   { F64 d = fma((F64)a, (F64)b, (F64)c); F32 f = (F32)d; if ((F64)f > d) f = nextafterf(f, -INFINITY); return f; }
++#else
+ template<class T> __device__ __inline__ void swap(T& a, T& b)               { T t = a; a = b; b = t; }
+ 
+ __device__ __inline__ U32   getLo                   (U64 a)                 { return __double2loint(__longlong_as_double(a)); }
+@@ -25,7 +118,7 @@ __device__ __inline__ U32   getLaneMaskLe           (void)                  { U3
+ __device__ __inline__ U32   getLaneMaskGt           (void)                  { U32 r; asm("mov.u32 %0, %lanemask_gt;" : "=r"(r)); return r; }
+ __device__ __inline__ U32   getLaneMaskGe           (void)                  { U32 r; asm("mov.u32 %0, %lanemask_ge;" : "=r"(r)); return r; }
+ __device__ __inline__ int   findLeadingOne          (U32 v)                 { U32 r; asm("bfind.u32 %0, %1;" : "=r"(r) : "r"(v)); return r; }
+-__device__ __inline__ bool  singleLane              (void)                  { return ((::__ballot_sync(~0u, true) & getLaneMaskLt()) == 0); }
++__device__ __inline__ bool  singleLane              (void)                  { return ((CR_BALLOT(~0u, true) & getLaneMaskLt()) == 0); }
+ 
+ __device__ __inline__ void  add_add_carry           (U32& rlo, U32 alo, U32 blo, U32& rhi, U32 ahi, U32 bhi) { U64 r = combineLoHi(alo, ahi) + combineLoHi(blo, bhi); rlo = getLo(r); rhi = getHi(r); }
+ __device__ __inline__ S32   f32_to_s32_sat          (F32 a)                 { S32 v; asm("cvt.rni.sat.s32.f32 %0, %1;" : "=r"(v) : "f"(a)); return v; }
+@@ -77,6 +170,7 @@ __device__ __inline__ F32   slct                    (F32 a, F32 b, S32 c)   { F3
+ __device__ __inline__ U32   isetge                  (S32 a, S32 b)          { U32 v; asm("set.ge.u32.s32 %0, %1, %2;" : "=r"(v) : "r"(a), "r"(b)); return v; }
+ __device__ __inline__ F64   rcp_approx              (F64 a)                 { F64 v; asm("rcp.approx.ftz.f64 %0, %1;" : "=d"(v) : "d"(a)); return v; }
+ __device__ __inline__ F32   fma_rm                  (F32 a, F32 b, F32 c)   { F32 v; asm("fma.rm.f32 %0, %1, %2, %3;" : "=f"(v) : "f"(a), "f"(b), "f"(c)); return v; }
++#endif
+ __device__ __inline__ U32   idiv_fast               (U32 a, U32 b);
+ 
+ __device__ __inline__ uint3 setupPleq               (float3 values, int2 v0, int2 d1, int2 d2, F32 areaRcp);
+@@ -369,7 +463,7 @@ template <class T> __device__ __inline__ void sortShared(T* ptr, int numItems)
+ 
+     int base = thrInBlock * 2;
+     bool act = (base < numItems - 1);
+-    U32 actMask = __ballot_sync(~0u, act);
++    U32 actMask = CR_BALLOT(~0u, act);
+     if (act)
+     {
+         bool tryOdd = (base < numItems - 2 && (~base & (range - 2)) != 0);
+@@ -385,7 +479,7 @@ template <class T> __device__ __inline__ void sortShared(T* ptr, int numItems)
+                 ptr[base + 0] = mid;
+                 mid = tmp;
+             }
+-            __syncwarp(actMask);
++            CR_SYNCWARP(actMask);
+ 
+             // Odds.
+ 
+@@ -398,7 +492,7 @@ template <class T> __device__ __inline__ void sortShared(T* ptr, int numItems)
+                     mid = tmp;
+                 }
+             }
+-            __syncwarp(actMask);
++            CR_SYNCWARP(actMask);
+         }
+         ptr[base + 1] = mid;
+     }
+diff --git a/csrc/common/interpolate.cu b/csrc/common/interpolate.cu
+index 3bd2a7a..65f1f1a 100644
+--- a/csrc/common/interpolate.cu
++++ b/csrc/common/interpolate.cu
+@@ -36,7 +36,7 @@ static __forceinline__ __device__ void InterpolateFwdKernelTemplate(const Interp
+ 
+     // If no geometry in entire warp, zero the output and exit.
+     // Otherwise force barys to zero and output with live threads.
+-    if (__all_sync(0xffffffffu, !triValid))
++    if (CR_ALL(0xffffffffu, !triValid))
+     {
+         for (int i=0; i < p.numAttr; i++)
+             out[i] = 0.f;
+diff --git a/csrc/common/texture_kernel.cu b/csrc/common/texture_kernel.cu
+index 490b8d6..a04bd8f 100644
+--- a/csrc/common/texture_kernel.cu
++++ b/csrc/common/texture_kernel.cu
+@@ -9,6 +9,16 @@
+ #include "common.h"
+ #include "texture.h"
+ 
++#if defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM)
++// __frcp_rz: reciprocal rounded toward zero. Correctly rounded 1/x, then step toward zero if it overshot.
++static __device__ __forceinline__ float __frcp_rz(float x)
++{
++    float r = __frcp_rn(x);
++    if (isfinite(r) && r != 0.f && fmaf(-r, x, 1.0f) < 0.f) r = nextafterf(r, 0.f);
++    return r;
++}
++#endif
++
+ //------------------------------------------------------------------------
+ // Memory access and math helpers.
+ 
+diff --git a/csrc/torch/torch_antialias.cpp b/csrc/torch/torch_antialias.cpp
+index 730a200..11c1ba1 100644
+--- a/csrc/torch/torch_antialias.cpp
++++ b/csrc/torch/torch_antialias.cpp
+@@ -6,7 +6,7 @@
+ // distribution of this software and related documentation without an express
+ // license agreement from NVIDIA CORPORATION is strictly prohibited.
+ 
+-#include "torch_common.inl"
++#include "torch_common.h"
+ #include "torch_types.h"
+ #include "../common/common.h"
+ #include "../common/antialias.h"
+diff --git a/csrc/torch/torch_bindings.cpp b/csrc/torch/torch_bindings.cpp
+index 898e17e..d6fc943 100644
+--- a/csrc/torch/torch_bindings.cpp
++++ b/csrc/torch/torch_bindings.cpp
+@@ -6,7 +6,7 @@
+ // distribution of this software and related documentation without an express
+ // license agreement from NVIDIA CORPORATION is strictly prohibited.
+ 
+-#include "torch_common.inl"
++#include "torch_common.h"
+ #include "torch_types.h"
+ #include <tuple>
+ 
+diff --git a/csrc/torch/torch_common.inl b/csrc/torch/torch_common.h
+similarity index 100%
+rename from csrc/torch/torch_common.inl
+rename to csrc/torch/torch_common.h
+diff --git a/csrc/torch/torch_interpolate.cpp b/csrc/torch/torch_interpolate.cpp
+index b2c99fc..fa80464 100644
+--- a/csrc/torch/torch_interpolate.cpp
++++ b/csrc/torch/torch_interpolate.cpp
+@@ -6,7 +6,7 @@
+ // distribution of this software and related documentation without an express
+ // license agreement from NVIDIA CORPORATION is strictly prohibited.
+ 
+-#include "torch_common.inl"
++#include "torch_common.h"
+ #include "../common/common.h"
+ #include "../common/interpolate.h"
+ 
+diff --git a/csrc/torch/torch_rasterize.cpp b/csrc/torch/torch_rasterize.cpp
+index 589e227..8098dac 100644
+--- a/csrc/torch/torch_rasterize.cpp
++++ b/csrc/torch/torch_rasterize.cpp
+@@ -6,12 +6,12 @@
+ // distribution of this software and related documentation without an express
+ // license agreement from NVIDIA CORPORATION is strictly prohibited.
+ 
+-#include "torch_common.inl"
++#include "torch_common.h"
+ #include "torch_types.h"
+ #include "../common/common.h"
+ #include "../common/rasterize.h"
+-#include "../common/cudaraster/CudaRaster.hpp"
+-#include "../common/cudaraster/impl/Constants.hpp"
++#include "../common/craster/CudaRaster.hpp"
++#include "../common/craster/impl/Constants.hpp"
+ #include <tuple>
+ 
+ //------------------------------------------------------------------------
+diff --git a/csrc/torch/torch_texture.cpp b/csrc/torch/torch_texture.cpp
+index c7540bd..3699db8 100644
+--- a/csrc/torch/torch_texture.cpp
++++ b/csrc/torch/torch_texture.cpp
+@@ -6,7 +6,7 @@
+ // distribution of this software and related documentation without an express
+ // license agreement from NVIDIA CORPORATION is strictly prohibited.
+ 
+-#include "torch_common.inl"
++#include "torch_common.h"
+ #include "torch_types.h"
+ #include "../common/common.h"
+ #include "../common/texture.h"
+diff --git a/csrc/torch/torch_types.h b/csrc/torch/torch_types.h
+index ebca9f3..ca6cab3 100644
+--- a/csrc/torch/torch_types.h
++++ b/csrc/torch/torch_types.h
+@@ -6,7 +6,7 @@
+ // distribution of this software and related documentation without an express
+ // license agreement from NVIDIA CORPORATION is strictly prohibited.
+ 
+-#include "torch_common.inl"
++#include "torch_common.h"
+ 
+ //------------------------------------------------------------------------
+ // Python CudaRaster state wrapper.
+diff --git a/setup.py b/setup.py
+index 1c604e6..4b5e40e 100644
+--- a/setup.py
++++ b/setup.py
+@@ -29,10 +29,10 @@ setuptools.setup(
+             sources=[
+                 "csrc/common/antialias.cu",
+                 "csrc/common/common.cpp",
+-                "csrc/common/cudaraster/impl/Buffer.cpp",
+-                "csrc/common/cudaraster/impl/CudaRaster.cpp",
+-                "csrc/common/cudaraster/impl/RasterImpl.cpp",
+-                "csrc/common/cudaraster/impl/RasterImpl_kernel.cu",
++                "csrc/common/craster/impl/Buffer.cpp",
++                "csrc/common/craster/impl/CudaRaster.cpp",
++                "csrc/common/craster/impl/RasterImpl.cpp",
++                "csrc/common/craster/impl/RasterImpl_kernel.cu",
+                 "csrc/common/interpolate.cu",
+                 "csrc/common/rasterize.cu",
+                 "csrc/common/texture.cpp",
