@@ -21,6 +21,23 @@ Microsoft's [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) image-to-3D pipe
 | `grid_sample_trilinear` | GPU | Trilinear sampling of features stored on a sparse voxel grid, any channel count. | 6.7M samples of 6 channels in 2.2 ms |
 | `pack_charts` | CPU | Parallel xatlas UV parameterization and packing of pre-cut charts. | UV unwrap 30–53 s → 1.2–2.8 s |
 
+## Why these kernels exist
+
+The official TRELLIS.2 pipeline spends about 80% of its image-to-GLB time in serial CPU post-processing, not in the
+networks. On an MI350X over five example images it takes 499.5 s; the port's fast build takes 48.0 s (10.4×), and 391 s
+of the 451 s saved is in mesh post-processing. The kernels in this repository are the reusable part of that:
+
+| Stage | Official pipeline | With these kernels |
+|---|---|---|
+| UV unwrap | xatlas packs ~16k charts one at a time on one CPU thread: 30–53 s per image | `pack_charts`: charts split into 64 groups packed in parallel threads, then tiled: 1.2–2.8 s (2–4% lower texel density) |
+| Texture inpainting | 4 × `cv2.inpaint` on the CPU: ~20 s | `telea_inpaint`: fills by distance level on the GPU: ~0.05 s |
+| BVH for remesh and texture bake | cuBVH built serially on the CPU: 6.8 s | `mesh_udf`: GPU linear BVH: 0.10–0.16 s |
+| Texture bake sampling | FlexGEMM Triton kernel, autotuned per image (~2 s) | `grid_sample_trilinear`: hash lookup and trilinear sample fused in one kernel, no autotuning |
+
+The rest of the speedup (fused diffusion-transformer kernels, batched guidance, a direct GLB writer) is specific to
+TRELLIS.2 and lives in the [port's repository](https://github.com/suvadityamuk/trellis2-rocm), which has the full
+stage-by-stage comparison, the bitwise-parity mode and the benchmark protocol.
+
 ## Usage
 
 ```python

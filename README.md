@@ -34,6 +34,25 @@ packing on the CPU: a second eager run on the same boot gave 535.4 s, and an ear
 ![per-image](docs/timing.png)
 ![total](docs/speedup.png)
 
+## Where the time goes
+
+The official pipeline spends about 80% of its time in serial CPU post-processing, not in the networks: of the 451 s
+the fast build saves over the five images, 391 s is in `to_glb`. What each mode changes, stage by stage:
+
+| Stage | Official baseline | t2r parity (bitwise identical) | t2r fast |
+|---|---|---|---|
+| UV unwrap | xatlas packs ~16k charts one at a time on one CPU thread: 30–53 s per image | Same packing, kept for parity | Charts split into 64 groups packed in parallel threads, then tiled: 1.2–2.8 s (2–4% lower texel density) |
+| Texture inpainting | 4 × `cv2.inpaint` on the CPU: ~20 s | Same algorithm, run in parallel: 10–16 s | GPU TELEA kernel that fills by distance level: ~0.05 s |
+| BVH for remesh and bake | cuBVH built serially on the CPU: 6.8 s | Same | GPU linear BVH: 0.10–0.16 s |
+| Mesh ops (simplify, chart clustering) | CuMesh with a `hipMalloc` per iteration and host-side fills | `t2r_cumesh`: caching allocator, device-side fills, same arithmetic | Same as parity |
+| Texture bake sampling | FlexGEMM Triton kernel, autotuned per image (~2 s) | HIP kernel reproducing it bitwise, no autotuning | Fused hash lookup and trilinear sample in one kernel |
+| GLB export | trimesh export with slow WebP encoding: 5.8–7.7 s | Same | Direct GLB writer, fast WebP setting, textures encoded in parallel: 0.6–1.3 s |
+| Diffusion transformers | Separate ops, two passes for guidance: 314 ms per step at 13k tokens | Same calls in the same order | Fused norm / RoPE / residual kernels, guidance batched into one pass, cached cross-attention K/V: 179 ms |
+| DiT attention | CK flash-attention | Same | PyTorch SDPA (AOTriton) |
+| **Total, 5 images** | **499.5 s** | **409.4 s (1.22×)** | **48.0 s (10.4×)** |
+
+The parity and fast sections below give the details and the accuracy cost of each fast-build change.
+
 ## Run it
 
 ```bash
