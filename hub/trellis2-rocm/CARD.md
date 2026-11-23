@@ -21,22 +21,63 @@ Microsoft's [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) image-to-3D pipe
 | `grid_sample_trilinear` | GPU | Trilinear sampling of features stored on a sparse voxel grid, any channel count. | 6.7M samples of 6 channels in 2.2 ms |
 | `pack_charts` | CPU | Parallel xatlas UV parameterization and packing of pre-cut charts. | UV unwrap 30–53 s → 1.2–2.8 s |
 
-## Why these kernels exist
+## Benchmarks
 
-The official TRELLIS.2 pipeline spends about 80% of its image-to-GLB time in serial CPU post-processing, not in the
-networks. On an MI350X over five example images it takes 499.5 s; the port's fast build takes 48.0 s (10.4×), and 391 s
-of the 451 s saved is in mesh post-processing. The kernels in this repository are the reusable part of that:
+The numbers are for the whole image → textured GLB pipeline of the port (`t2r`), which is where these kernels run.
+MI350X (VF), torch 2.13 + ROCm 10.1, TRELLIS.2-4B `1024_cascade`, five example images, seconds per image:
 
-| Stage | Official pipeline | With these kernels |
-|---|---|---|
-| UV unwrap | xatlas packs ~16k charts one at a time on one CPU thread: 30–53 s per image | `pack_charts`: charts split into 64 groups packed in parallel threads, then tiled: 1.2–2.8 s (2–4% lower texel density) |
-| Texture inpainting | 4 × `cv2.inpaint` on the CPU: ~20 s | `telea_inpaint`: fills by distance level on the GPU: ~0.05 s |
-| BVH for remesh and texture bake | cuBVH built serially on the CPU: 6.8 s | `mesh_udf`: GPU linear BVH: 0.10–0.16 s |
-| Texture bake sampling | FlexGEMM Triton kernel, autotuned per image (~2 s) | `grid_sample_trilinear`: hash lookup and trilinear sample fused in one kernel, no autotuning |
+| Image | Official eager | Official torch.compile | t2r parity | t2r fast | fast vs eager | fast vs compile |
+|---|---|---|---|---|---|---|
+| 0a34 | 99.9 | 102.0 | 70.6 | **7.5** | 13.3× | 13.6× |
+| 0e49 | 128.0 | 140.7 | 106.7 | **15.4** | 8.3× | 9.2× |
+| 0f16 | 89.8 | 103.4 | 78.9 | **10.8** | 8.3× | 9.6× |
+| 130c | 90.4 | 92.3 | 78.8 | **5.4** | 16.8× | 17.1× |
+| T.png | 91.3 | 90.7 | 74.4 | **8.9** | 10.2× | 10.1× |
+| **Sum** | 499.5 | 529.1 | 409.4 (1.22× / 1.29×) | **48.0** | **10.4×** | **11.0×** |
 
-The rest of the speedup (fused diffusion-transformer kernels, batched guidance, a direct GLB writer) is specific to
-TRELLIS.2 and lives in the [port's repository](https://github.com/suvadityamuk/trellis2-rocm), which has the full
-stage-by-stage comparison, the bitwise-parity mode and the benchmark protocol.
+- **t2r parity** is bitwise identical to the official PyTorch pipeline running on ROCm. **t2r fast** uses the kernels
+  in this repository plus fused diffusion-transformer kernels, and is tolerance-bounded against the official pipeline.
+- Times cover the networks, `to_glb` and GLB export; model loading is excluded. All four configurations use the same
+  protocol: one process, one warmup image, then every image once untimed, then the timed pass.
+- By phase, summed over the five images:
+
+| Phase | Official eager | Official torch.compile | t2r parity | t2r fast |
+|---|---|---|---|---|
+| Networks | 59.8 | 66.7 | 50.2 | 29.8 |
+| `to_glb` (mesh post-processing) | 404.3 | 422.0 | 312.2 | 13.6 |
+| GLB export | 35.3 | 40.4 | 46.9 | 4.6 |
+
+The official numbers move between runs and machine boots, because most of their time is single-threaded xatlas packing
+on the CPU: a second eager run on the same boot gave 535.4 s, and an earlier boot of the same VM gave about 700 s
+(fast: 47.7 s there, 48.0 s here). The fast build's time is stable, so the ratio follows the baseline.
+
+![Per-image time by configuration](https://raw.githubusercontent.com/suvadityamuk/trellis2-rocm/main/docs/timing.png)
+![Total time and speedup](https://raw.githubusercontent.com/suvadityamuk/trellis2-rocm/main/docs/speedup.png)
+
+Raw numbers, benchmark scripts and the accuracy comparison are in the
+[port's repository](https://github.com/suvadityamuk/trellis2-rocm) (`bench/`, `tools/bench_ref.py`, `tools/bench_t2r.py`).
+
+## Where the time goes
+
+The official pipeline spends about 80% of its time in serial CPU post-processing, not in the networks: of the 451 s
+the fast build saves over the five images, 391 s is in `to_glb`. What each mode changes, stage by stage, and which
+kernel from this repository does it:
+
+| Stage | Official baseline | t2r parity (bitwise identical) | t2r fast | Kernel here |
+|---|---|---|---|---|
+| UV unwrap | xatlas packs ~16k charts one at a time on one CPU thread: 30–53 s per image | Same packing, kept for parity | Charts split into 64 groups packed in parallel threads, then tiled: 1.2–2.8 s (2–4% lower texel density) | `pack_charts` |
+| Texture inpainting | 4 × `cv2.inpaint` on the CPU: ~20 s | Same algorithm, run in parallel: 10–16 s | GPU TELEA kernel that fills by distance level: ~0.05 s | `telea_inpaint` |
+| BVH for remesh and bake | cuBVH built serially on the CPU: 6.8 s | Same | GPU linear BVH: 0.10–0.16 s | `mesh_udf` |
+| Texture bake sampling | FlexGEMM Triton kernel, autotuned per image (~2 s) | HIP kernel reproducing it bitwise, no autotuning | Fused hash lookup and trilinear sample in one kernel | `grid_sample_trilinear` |
+| Mesh ops (simplify, chart clustering) | CuMesh with a `hipMalloc` per iteration and host-side fills | `t2r_cumesh`: caching allocator, device-side fills, same arithmetic | Same as parity | in the port |
+| GLB export | trimesh export with slow WebP encoding: 5.8–7.7 s | Same | Direct GLB writer, fast WebP setting, textures encoded in parallel: 0.6–1.3 s | in the port |
+| Diffusion transformers | Separate ops, two passes for guidance: 314 ms per step at 13k tokens | Same calls in the same order | Fused norm / RoPE / residual kernels, guidance batched into one pass, cached cross-attention K/V: 179 ms | in the port |
+| DiT attention | CK flash-attention | Same | PyTorch SDPA (AOTriton) | in the port |
+| **Total, 5 images** | **499.5 s** | **409.4 s (1.22×)** | **48.0 s (10.4×)** | |
+
+The first four rows are the reusable part and are what this repository packages. The rest is specific to TRELLIS.2 and
+lives in the [port's repository](https://github.com/suvadityamuk/trellis2-rocm), which also documents the
+bitwise-parity method and the accuracy cost of each fast-build change.
 
 ## Usage
 
