@@ -55,14 +55,34 @@ The parity and fast sections below give the details and the accuracy cost of eac
 
 ## Run it
 
+You need an AMD Instinct GPU (MI300 gfx942 or MI350 gfx950; only an MI350X has been tested), ROCm, and a ROCm build
+of PyTorch with torchvision already installed: the setup script does not install them (tested: torch 2.13 + ROCm
+10.1, Python 3.14). The DINOv3 image encoder is gated: accept its licence on
+[its Hub page](https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m), then put your token in `.env` at the
+repository root as `HF_TOKEN=hf_xxx` (no quotes).
+
 ```bash
-tools/setup_rocm.sh                                                # once: deps, ROCm ports, t2r, weights (HF_TOKEN in .env)
-python examples/image_to_glb.py image.png --out out.glb            # fast mode; --mode parity for the bitwise path
+git clone https://github.com/suvadityamuk/trellis2-rocm && cd trellis2-rocm
+echo "HF_TOKEN=hf_xxx" > .env
+tools/setup_rocm.sh                                       # once: dependencies, ROCm ports, t2r kernels, weights
+python examples/image_to_glb.py image.png --out out.glb   # fast build
+python examples/image_to_glb.py image.png --out out.glb --mode parity   # bitwise match of the official pipeline
 ```
 
-The input must be RGBA with the background already removed. A fresh process takes about 22 s to load the models and
-about 20 s for its first image (one-time kernel and cache warmup); later images in the same process take the times
-in the table above.
+`tools/setup_rocm.sh` clones the official TRELLIS.2 repository and the ROCm-patched dependencies (flash-attention,
+FlexGEMM, CuMesh, nvdiffrast, o-voxel) into `~/src`, installs them into the active Python environment, builds the t2r
+kernels in place (`t2r/_C*.so`, git-ignored), and downloads TRELLIS.2-4B to `~/ckpts/TRELLIS.2-4B`. Building
+flash-attention takes a while; the weights need about 20 GB of disk. DINOv3 and the TRELLIS-image-large
+sparse-structure decoder are downloaded into the Hugging Face cache on the first run. To build for one GPU or use
+other folders, run `ARCHS=gfx950 SRC=/path/src TRELLIS2_CKPT=/path/ckpts tools/setup_rocm.sh`, and then
+`export TRELLIS2_SRC=/path/src/TRELLIS.2 TRELLIS2_CKPT=/path/ckpts` before running inference. After editing
+`csrc/`, rebuild the kernels with `T2R_ARCHS=gfx950 python setup.py build_ext --inplace`.
+
+`examples/image_to_glb.py` runs from the repository root (t2r is not installed as a package). With no image it uses
+the official `T.png`; the output defaults to `./out.glb`. Other flags: `--seed` (42), `--texture-size` (4096),
+`--decimation-target` (faces in the exported mesh, 1000000). The input must be RGBA with the background already
+removed. A fresh process takes about 22 s to load the models and about 20 s for its first image (one-time kernel and
+cache warmup); later images in the same process take the times in the table above.
 
 ## Outputs
 
